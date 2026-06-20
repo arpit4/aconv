@@ -93,5 +93,16 @@ python3 aconv.py /path/to/my_music mp3 --quality 2 --sample-rate 44100
 3. Spawns an `ffmpeg` subprocess for each file needing conversion, executing them in parallel.
 4. Outputs the converted files into the destination folder, mimicking the original directory tree.
 
+## Notes
+
+- **Codec is chosen by ffmpeg from the target extension.** The container's default
+  codec applies, and these defaults can vary between ffmpeg versions. For example,
+  recent ffmpeg defaults the `.ogg` container to the **FLAC** codec (lossless), in
+  which case `--bitrate` has no effect. Prefer an extension that maps unambiguously
+  to your intended codec (e.g. `.mp3`, `.opus`) when bitrate matters.
+- **Non-interactive use.** When run without a terminal (scripts, CI, piped input),
+  the tool does not prompt: it converts all audio files and skips any already in the
+  target format. Provide `source` and `format` as arguments in that case.
+
 ## License
 MIT License

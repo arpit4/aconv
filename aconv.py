@@ -92,12 +92,20 @@ def main():
         print("Error: --workers must be a positive integer.")
         sys.exit(1)
 
+    interactive = sys.stdin.isatty()
+
     if not args.source:
+        if not interactive:
+            print("Error: source is required (no input available to prompt for it).")
+            sys.exit(1)
         args.source = input("Enter the source directory or file path: ").strip()
         while not args.source:
             args.source = input("Source path cannot be empty. Enter source directory or file path: ").strip()
 
     if not args.format:
+        if not interactive:
+            print("Error: target format is required (no input available to prompt for it).")
+            sys.exit(1)
         args.format = input("Enter the target audio format (e.g., mp3, wav, flac): ").strip()
         while not args.format:
             args.format = input("Target format cannot be empty. Enter the target audio format: ").strip()
@@ -112,7 +120,9 @@ def main():
 
     check_ffmpeg()
 
-    if not args.ext and source_path.is_dir():
+    # Only prompt for an extension filter interactively; under automation
+    # (no TTY) default to converting all audio files rather than crashing.
+    if not args.ext and source_path.is_dir() and interactive:
         ext_input = input("Enter specific source extension to convert (e.g. m4a), or press Enter to convert all audio files: ").strip()
         if ext_input:
             args.ext = ext_input
@@ -152,10 +162,15 @@ def main():
         if len(already_in_format) > 5:
             print(f"  ... and {len(already_in_format) - 5} more.")
 
-        while True:
-            choice = input(f"\nWould you like to [c]opy, [m]ove, or [s]kip these files to the destination? ").strip().lower()
-            if choice in ['c', 'm', 's', 'copy', 'move', 'skip']:
-                break
+        if not interactive:
+            # No TTY: default to the non-destructive choice rather than crash.
+            print("Non-interactive run: skipping files already in the target format.")
+            choice = 's'
+        else:
+            while True:
+                choice = input(f"\nWould you like to [c]opy, [m]ove, or [s]kip these files to the destination? ").strip().lower()
+                if choice in ['c', 'm', 's', 'copy', 'move', 'skip']:
+                    break
 
         if choice.startswith('m'):
             # Moving deletes the originals; require explicit confirmation.
