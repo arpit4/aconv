@@ -5,9 +5,11 @@ A fast, interactive, and offline command-line tool for converting audio files be
 ## Features
 
 - **Interactive Mode**: Run the script with no arguments to be prompted for inputs.
-- **Fast & Parallel**: Uses all available CPU cores to convert files simultaneously.
+- **Fast & Parallel**: Converts files concurrently (defaults to half your CPU cores to avoid oversubscribing ffmpeg, which is itself multi-threaded).
+- **Quality Control**: Set bitrate, VBR quality, and sample rate via flags.
 - **Smart Directory Handling**: Replicates the original folder structure in the destination.
-- **Existing File Detection**: Automatically detects files that are already in the target format and offers to copy, move, or skip them without re-encoding.
+- **Collision-Safe**: Files that would map to the same output name (e.g. `song.wav` and `song.flac` both mapping to `song.mp3`) are disambiguated instead of silently overwritten.
+- **Existing File Detection**: Automatically detects files that are already in the target format and offers to copy, move, or skip them without re-encoding (moves require explicit confirmation).
 - **Format Filtering**: Optionally filter conversions to a specific source extension.
 - **Clean Progress Bar**: Shows conversion progress via `tqdm`.
 
@@ -62,6 +64,27 @@ python3 aconv.py /path/to/my_music wav --dest /path/to/destination_folder
 ```bash
 python3 aconv.py /path/to/song.m4a flac
 ```
+
+**Convert to 320k CBR mp3 with 4 workers:**
+```bash
+python3 aconv.py /path/to/my_music mp3 --bitrate 320k --workers 4
+```
+
+**Convert to VBR mp3 (quality 2) at 44.1 kHz:**
+```bash
+python3 aconv.py /path/to/my_music mp3 --quality 2 --sample-rate 44100
+```
+
+### Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--dest` | Destination directory | `<source>_<format>` next to the source |
+| `--ext` | Only convert this source extension (e.g. `m4a`) | all audio files |
+| `--workers` | Number of parallel conversions | half the CPU cores |
+| `--bitrate` | Target audio bitrate / CBR (e.g. `320k`) | ffmpeg default |
+| `--quality` | VBR quality (ffmpeg `-q:a`, e.g. `2` for mp3) | ffmpeg default |
+| `--sample-rate` | Target sample rate in Hz (e.g. `44100`) | source rate |
 
 ## How It Works
 
