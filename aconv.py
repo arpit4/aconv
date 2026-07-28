@@ -12,13 +12,29 @@ except ImportError:
     print("tqdm not installed. Please run: pip install -r requirements.txt")
     sys.exit(1)
 
-AUDIO_EXTENSIONS = {'.m4a', '.mp3', '.wav', '.flac', '.ogg', '.aac', '.wma', '.alac', '.aiff', '.opus'}
+# Extensions picked up when scanning a directory. Audio-only containers, so that
+# scanning a folder of home videos does not quietly rip their soundtracks; a file
+# named directly on the command line is converted whatever its extension.
+# ('.alac' is deliberately absent: ALAC is a codec that lives inside .m4a.)
+AUDIO_EXTENSIONS = {
+    '.mp3', '.mp2', '.m4a', '.m4b', '.aac', '.wav', '.flac', '.ogg', '.oga',
+    '.opus', '.wma', '.aiff', '.aif', '.aifc', '.mka', '.caf', '.wv', '.ape',
+    '.amr', '.dsf',
+}
 
 # Containers that can carry an embedded cover image. For every other target the
 # attached picture has to be dropped, because ffmpeg otherwise tries to re-encode
 # it with the container's default video codec and fails outright (for example
 # .ogg defaults to theora, which is usually not built in).
 ART_CAPABLE_FORMATS = {'mp3', 'flac', 'm4a', 'm4b', 'mp4'}
+
+# Verb and present participle for the three ways of handling files that are
+# already in the target format, keyed by the first letter of the choice.
+ON_EXISTING_WORDS = {'c': ('copy', 'copying'), 'm': ('move', 'moving'), 's': ('skip', 'skipping')}
+
+# Above this many files, show progress while measuring durations. Below it the
+# measuring pass is over before a bar would finish drawing.
+MEASURE_PROGRESS_THRESHOLD = 50
 
 def prompt(message, default=None):
     """input() that returns `default` instead of raising when stdin hits EOF."""
@@ -41,13 +57,22 @@ def prompt_required(message, retry_message):
 
 def check_ffmpeg():
     try:
-        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       stdin=subprocess.DEVNULL, check=True, timeout=15)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         print("Error: ffmpeg is not installed or not found in PATH.")
         print("Please install it (e.g., 'brew install ffmpeg' on macOS) and try again.")
         sys.exit(1)
 
-def find_audio_files(source_dir, ext_filter=None):
+def is_within(path, directory):
+    """True if `path` is `directory` or sits underneath it."""
+    try:
+        path.relative_to(directory)
+        return True
+    except ValueError:
+        return False
+
+def find_audio_files(source_dir, ext_filter=None, exclude_dir=None):
     audio_files = []
     source_path = Path(source_dir)
 
@@ -56,17 +81,59 @@ def find_audio_files(source_dir, ext_filter=None):
         if not ext_filter.startswith('.'):
             ext_filter = '.' + ext_filter
 
-    if source_path.is_file() and source_path.suffix.lower() in AUDIO_EXTENSIONS:
+    if source_path.is_file():
+        # A file named explicitly on the command line is converted whatever its
+        # extension: ffmpeg reads many more containers than AUDIO_EXTENSIONS
+        # lists, and refusing a file the user pointed at is just obstructive.
         if ext_filter and source_path.suffix.lower() != ext_filter:
             return []
         return [source_path]
 
     for path in source_path.rglob('*'):
+        # Never pick up our own output, so that a destination inside the source
+        # tree does not get re-converted on the next run.
+        if exclude_dir is not None and is_within(path, exclude_dir):
+            continue
         if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
             if ext_filter and path.suffix.lower() != ext_filter:
                 continue
             audio_files.append(path)
     return audio_files
+
+def probe_duration(path):
+    """Length of `path` in seconds, or None if ffprobe cannot determine it."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=nw=1:nk=1', str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        duration = float(result.stdout.decode('utf-8', errors='replace').strip())
+    except ValueError:
+        return None
+    return duration if duration > 0 else None
+
+def measure_durations(files, workers):
+    """Per-file durations, or None if any file cannot be measured.
+
+    Used to weight the progress bar: counting files makes a 3 minute track and
+    a 90 minute podcast advance it equally. All or nothing, because a partial
+    set of weights would be more misleading than plain file counts.
+    """
+    if not shutil.which('ffprobe'):
+        return None
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # One ffprobe per file is quick, but on a large library the wait is long
+        # enough to look like a hang, so show it for anything sizeable.
+        durations = list(tqdm(executor.map(probe_duration, files), total=len(files),
+                              desc="Measuring", unit="file", leave=False,
+                              disable=len(files) < MEASURE_PROGRESS_THRESHOLD))
+    if any(d is None for d in durations):
+        return None
+    return durations
 
 def convert_file(source_file, dest_file, extra_args=None):
     # Ensure destination directory exists
@@ -188,6 +255,16 @@ def main():
                               type=int, default=None)
     parser.add_argument("--sample-rate", dest="sample_rate", type=int, default=None,
                         help="Target sample rate in Hz, e.g. 44100")
+    parser.add_argument("--on-existing", dest="on_existing", choices=['copy', 'move', 'skip'],
+                        default=None,
+                        help="What to do with files already in the target format, "
+                             "without prompting. 'move' removes the originals")
+    parser.add_argument("--skip-existing", dest="skip_existing", action="store_true",
+                        help="Leave outputs that already exist alone instead of re-encoding them")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="Print what would happen and exit without writing anything")
+    parser.add_argument("--no-input", dest="no_input", action="store_true",
+                        help="Never prompt; use the defaults and fail if a required value is missing")
 
     args = parser.parse_args()
 
@@ -195,7 +272,12 @@ def main():
         print("Error: --workers must be a positive integer.")
         sys.exit(1)
 
-    interactive = sys.stdin.isatty()
+    # Whether the run started fully specified. The optional extension filter is
+    # only worth asking about when the user is already being guided through the
+    # required values; a complete command line should just run.
+    guided = not (args.source and args.format)
+
+    interactive = sys.stdin.isatty() and not args.no_input
 
     if not args.source:
         if not interactive:
@@ -223,9 +305,9 @@ def main():
 
     check_ffmpeg()
 
-    # Only prompt for an extension filter interactively; under automation
-    # (no TTY) default to converting all audio files rather than crashing.
-    if not args.ext and source_path.is_dir() and interactive:
+    # Only offer the extension filter when the user is already being walked
+    # through the required values. A fully specified command line runs as given.
+    if not args.ext and source_path.is_dir() and interactive and guided:
         ext_input = prompt("Enter specific source extension to convert (e.g. m4a), or press Enter to convert all audio files: ")
         if ext_input:
             args.ext = ext_input
@@ -242,7 +324,11 @@ def main():
         else:
             dest_dir = source_path.parent / f"{source_path.name}_{target_format}"
 
-    audio_files = find_audio_files(source_path, args.ext)
+    # Converting in place, with --dest pointing at the source itself, is a
+    # legitimate thing to ask for, so only a destination strictly inside the
+    # tree is excluded from the scan.
+    exclude_dir = dest_dir if dest_dir != source_path else None
+    audio_files = find_audio_files(source_path, args.ext, exclude_dir=exclude_dir)
 
     if not audio_files:
         print(f"No audio files found in '{args.source}'.")
@@ -266,7 +352,12 @@ def main():
         if len(already_in_format) > 5:
             print(f"  ... and {len(already_in_format) - 5} more.")
 
-        if not interactive:
+        if args.on_existing:
+            # An explicit flag is the decision, including for move: asking a
+            # script to confirm what it just asked for would only deadlock it.
+            choice = args.on_existing[0]
+            print(f"--on-existing {args.on_existing}: {ON_EXISTING_WORDS[choice][1]} these files.")
+        elif not interactive:
             # No TTY: default to the non-destructive choice rather than crash.
             print("Non-interactive run: skipping files already in the target format.")
         else:
@@ -276,12 +367,13 @@ def main():
                     choice = answer
                     break
 
-        if choice.startswith('m'):
-            # Moving deletes the originals; require explicit confirmation.
-            confirm = prompt(f"This will MOVE (remove) {len(already_in_format)} original file(s). Type 'yes' to proceed: ", '').lower()
-            if confirm != 'yes':
-                print("Move cancelled; skipping these files.")
-                choice = 's'
+            if choice.startswith('m') and not args.dry_run:
+                # Moving deletes the originals; require explicit confirmation.
+                # Not under --dry-run, where nothing is going to move.
+                confirm = prompt(f"This will MOVE (remove) {len(already_in_format)} original file(s). Type 'yes' to proceed: ", '').lower()
+                if confirm != 'yes':
+                    print("Move cancelled; skipping these files.")
+                    choice = 's'
 
     # Reserve destinations for the copied or moved files before planning the
     # conversions, so that converting song.wav cannot overwrite a song.mp3 that
@@ -289,6 +381,28 @@ def main():
     keep_files = already_in_format if choice.startswith(('c', 'm')) else []
     keep_plan, convert_plan = plan_destinations(
         source_path, dest_dir, keep_files, to_convert, target_format)
+
+    if args.skip_existing:
+        # Applies to the copied and moved files too, so that resuming an
+        # interrupted run does not re-copy, or move an original on top of a
+        # destination that already holds it.
+        planned = len(keep_plan) + len(convert_plan)
+        keep_plan = [(src, dst) for src, dst in keep_plan if not dst.exists()]
+        convert_plan = [(src, dst) for src, dst in convert_plan if not dst.exists()]
+        skipped = planned - len(keep_plan) - len(convert_plan)
+        if skipped:
+            print(f"--skip-existing: leaving {skipped} existing output file(s) alone.")
+
+    if args.dry_run:
+        verb, participle = ON_EXISTING_WORDS[choice[0]]
+        print(f"\nDry run. Nothing will be written to {dest_dir}.")
+        for source_file, dest_file in keep_plan:
+            print(f"  {participle} {source_file} -> {dest_file}")
+        for source_file, dest_file in convert_plan:
+            print(f"  converting {source_file} -> {dest_file}")
+        print(f"  ffmpeg options: {' '.join(extra_args)}")
+        print(f"\n{len(keep_plan)} file(s) to {verb}, {len(convert_plan)} to convert.")
+        sys.exit(0)
 
     if keep_plan:
         action_name = "Copying" if choice.startswith('c') else "Moving"
@@ -310,18 +424,29 @@ def main():
     if args.bitrate or args.quality is not None or args.sample_rate:
         print(f"ffmpeg options: {' '.join(extra_args)}")
 
+    # Weight the bar by audio length where possible, so that one long podcast
+    # among short tracks does not make the bar stall near the end.
+    durations = measure_durations([src for src, _ in convert_plan], args.workers)
+    if durations:
+        weights = {src: seconds for (src, _), seconds in zip(convert_plan, durations)}
+        bar_args = dict(total=sum(durations), unit='s', unit_scale=True)
+    else:
+        weights = None
+        bar_args = dict(total=len(convert_plan), unit='file')
+
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        tasks = [executor.submit(convert_file, src, dst, extra_args) for src, dst in convert_plan]
+        tasks = {executor.submit(convert_file, src, dst, extra_args): src
+                 for src, dst in convert_plan}
 
         success_count = 0
-        with tqdm(total=len(tasks), desc="Converting", unit="file") as pbar:
+        with tqdm(desc="Converting", **bar_args) as pbar:
             for future in as_completed(tasks):
                 success, result = future.result()
                 if success:
                     success_count += 1
                 else:
                     tqdm.write(result)  # Print error without breaking progress bar
-                pbar.update(1)
+                pbar.update(weights[tasks[future]] if weights else 1)
 
     failed_count = len(convert_plan) - success_count
     print(f"\nConversion complete! {success_count}/{len(convert_plan)} files successfully converted.")
