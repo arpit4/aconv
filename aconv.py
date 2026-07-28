@@ -32,6 +32,10 @@ ART_CAPABLE_FORMATS = {'mp3', 'flac', 'm4a', 'm4b', 'mp4'}
 # already in the target format, keyed by the first letter of the choice.
 ON_EXISTING_WORDS = {'c': ('copy', 'copying'), 'm': ('move', 'moving'), 's': ('skip', 'skipping')}
 
+# Above this many files, show progress while measuring durations. Below it the
+# measuring pass is over before a bar would finish drawing.
+MEASURE_PROGRESS_THRESHOLD = 50
+
 def prompt(message, default=None):
     """input() that returns `default` instead of raising when stdin hits EOF."""
     try:
@@ -122,7 +126,11 @@ def measure_durations(files, workers):
     if not shutil.which('ffprobe'):
         return None
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        durations = list(executor.map(probe_duration, files))
+        # One ffprobe per file is quick, but on a large library the wait is long
+        # enough to look like a hang, so show it for anything sizeable.
+        durations = list(tqdm(executor.map(probe_duration, files), total=len(files),
+                              desc="Measuring", unit="file", leave=False,
+                              disable=len(files) < MEASURE_PROGRESS_THRESHOLD))
     if any(d is None for d in durations):
         return None
     return durations
@@ -316,7 +324,11 @@ def main():
         else:
             dest_dir = source_path.parent / f"{source_path.name}_{target_format}"
 
-    audio_files = find_audio_files(source_path, args.ext, exclude_dir=dest_dir)
+    # Converting in place, with --dest pointing at the source itself, is a
+    # legitimate thing to ask for, so only a destination strictly inside the
+    # tree is excluded from the scan.
+    exclude_dir = dest_dir if dest_dir != source_path else None
+    audio_files = find_audio_files(source_path, args.ext, exclude_dir=exclude_dir)
 
     if not audio_files:
         print(f"No audio files found in '{args.source}'.")
@@ -355,8 +367,9 @@ def main():
                     choice = answer
                     break
 
-            if choice.startswith('m'):
+            if choice.startswith('m') and not args.dry_run:
                 # Moving deletes the originals; require explicit confirmation.
+                # Not under --dry-run, where nothing is going to move.
                 confirm = prompt(f"This will MOVE (remove) {len(already_in_format)} original file(s). Type 'yes' to proceed: ", '').lower()
                 if confirm != 'yes':
                     print("Move cancelled; skipping these files.")

@@ -356,6 +356,18 @@ class SourceSelectionTest(TempDirTestCase):
         self.assertEqual(produced, ["music/a.wav", "music/out/a.flac"],
                          "the destination was picked up as a source")
 
+    def test_converting_in_place_still_finds_the_sources(self):
+        """--dest pointing at the source must not exclude the whole tree."""
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+
+        result = run_aconv("music", "mp3", "--dest", "music", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((source / "a.mp3").is_file())
+        self.assertTrue((source / "a.wav").is_file())
+
     def test_durations_measure_the_progress_bar_weights(self):
         source = self.tmp / "music"
         source.mkdir()
