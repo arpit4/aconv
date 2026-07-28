@@ -157,6 +157,11 @@ python3 aconv.py /path/to/my_music mp3 --no-input
 `0` when every file converted, `1` on a usage error or if any file failed to convert,
 `2` on invalid arguments, `130` if interrupted with Ctrl-C.
 
+Ctrl-C drops everything still queued and waits only for the conversions already
+running, so it stops in about the time one file takes rather than finishing the
+batch. Any half-written output is removed, so a later `--skip-existing` run
+resumes from the last file that actually completed.
+
 ## How It Works
 
 1. Scans the source for audio files, skipping the destination if it sits inside
