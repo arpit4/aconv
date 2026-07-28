@@ -317,6 +317,29 @@ class InterruptTest(TempDirTestCase):
                 quiet = 0
         return False
 
+    def test_interrupt_drops_the_queued_duration_probes(self):
+        """The measuring pass runs its own pool, with the same drain problem."""
+        probed = []
+
+        def slow_probe(path):
+            probed.append(path)
+            if len(probed) == 1:
+                threading.Timer(0.15, os.kill, [os.getpid(), signal.SIGINT]).start()
+            time.sleep(0.05)
+            return 1.0
+
+        original = aconv.probe_duration
+        aconv.probe_duration = slow_probe
+        self.addCleanup(setattr, aconv, "probe_duration", original)
+
+        files = [self.tmp / f"in{i}.wav" for i in range(40)]
+        with self.assertRaises(KeyboardInterrupt):
+            aconv.measure_durations(files, workers=1)
+
+        self.assertTrue(self._wait_until_quiet(probed), "the pool never settled")
+        self.assertLess(len(probed), 15,
+                        f"kept probing after the interrupt: {len(probed)} of {len(files)}")
+
     def test_uninterrupted_runs_convert_everything(self):
         plan = self._plan(6)
         converted = []

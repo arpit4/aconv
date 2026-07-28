@@ -126,11 +126,18 @@ def measure_durations(files, workers):
     if not shutil.which('ffprobe'):
         return None
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        # One ffprobe per file is quick, but on a large library the wait is long
-        # enough to look like a hang, so show it for anything sizeable.
-        durations = list(tqdm(executor.map(probe_duration, files), total=len(files),
-                              desc="Measuring", unit="file", leave=False,
-                              disable=len(files) < MEASURE_PROGRESS_THRESHOLD))
+        tasks = [executor.submit(probe_duration, f) for f in files]
+        try:
+            # One ffprobe per file is quick, but on a large library the wait is
+            # long enough to look like a hang, so show it for anything sizeable.
+            durations = [task.result() for task in
+                         tqdm(tasks, desc="Measuring", unit="file", leave=False,
+                              disable=len(files) < MEASURE_PROGRESS_THRESHOLD)]
+        except KeyboardInterrupt:
+            # Same reason as run_conversions: the queue would otherwise drain.
+            for task in tasks:
+                task.cancel()
+            raise
     if any(d is None for d in durations):
         return None
     return durations
