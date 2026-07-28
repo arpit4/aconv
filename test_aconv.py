@@ -195,6 +195,51 @@ class FailureReasonTest(unittest.TestCase):
         self.assertEqual(aconv.failure_reason(""), "ffmpeg reported no error output")
 
 
+class StreamCopyDecisionTest(unittest.TestCase):
+    """The remux-or-encode decision, with the codec probe stubbed out."""
+
+    def stub_probe(self, value):
+        original = aconv.probe_audio_codecs
+        aconv.probe_audio_codecs = lambda path: value
+        self.addCleanup(setattr, aconv, "probe_audio_codecs", original)
+
+    def test_matching_codec_is_remuxed(self):
+        self.stub_probe(("flac",))
+        self.assertTrue(aconv.should_stream_copy(Path("song.mka"), "flac"))
+
+    def test_mismatched_codec_is_encoded(self):
+        self.stub_probe(("vorbis",))
+        self.assertFalse(aconv.should_stream_copy(Path("song.mka"), "flac"))
+
+    def test_probe_failure_falls_back_to_encode(self):
+        self.stub_probe(None)
+        self.assertFalse(aconv.should_stream_copy(Path("song.mka"), "flac"))
+
+    def test_a_mixed_codec_source_is_encoded(self):
+        """ffmpeg picks the kept stream itself, so any mismatch means encode."""
+        self.stub_probe(("flac", "vorbis"))
+        self.assertFalse(aconv.should_stream_copy(Path("song.mka"), "flac"))
+
+    def test_an_unmapped_target_never_probes(self):
+        def explode(path):
+            raise AssertionError("probed a file for a target with no codec map")
+        original = aconv.probe_audio_codecs
+        aconv.probe_audio_codecs = explode
+        self.addCleanup(setattr, aconv, "probe_audio_codecs", original)
+
+        self.assertFalse(aconv.should_stream_copy(Path("song.flac"), "mka"))
+
+    def test_stream_copy_args_copy_the_audio_stream(self):
+        args = argparse.Namespace(bitrate=None, quality=None, sample_rate=None)
+
+        remux = aconv.build_ffmpeg_args(args, "flac", stream_copy=True)
+        encode = aconv.build_ffmpeg_args(args, "flac")
+
+        copy_at = remux.index("-c:a")
+        self.assertEqual(remux[copy_at:copy_at + 2], ["-c:a", "copy"])
+        self.assertNotIn("-c:a", encode)
+
+
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
 class ResolveOptionsTest(TempDirTestCase):
     """The copy/move/skip decision and destination resolution, in-process.
@@ -291,6 +336,7 @@ class ExecuteTest(TempDirTestCase):
 
     def options(self, **overrides):
         base = dict(dest_dir=self.tmp / "out", target_format="mp3", extra_args=[],
+                    remux_sources=set(), remux_args=[],
                     choice='s', keep_plan=[], convert_plan=[], dry_run=False,
                     workers=1, bitrate=None, quality=None, sample_rate=None)
         base.update(overrides)
@@ -522,6 +568,68 @@ class ConversionTest(TempDirTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skipping files already in the target format", result.stdout)
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+class StreamCopyTest(TempDirTestCase):
+    """Cross-container remuxes: FLAC inside Matroska converted to .flac."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = self.tmp.resolve()
+        self.source = self.tmp / "music"
+        self.source.mkdir()
+        make_tone(self.source / "song.mka", extra=["-c:a", "flac"])
+
+    def resolve(self, *cli_args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            options = aconv.resolve_options(list(cli_args))
+        return options, out.getvalue()
+
+    def test_flac_in_mka_is_remuxed_to_flac(self):
+        result = run_aconv("music", "flac", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("remuxing without re-encoding", result.stdout)
+        _, codec = probe(self.tmp / "music_flac" / "song.flac", "stream=codec_name")
+        self.assertEqual(codec, "flac")
+
+    def test_resolve_marks_the_matching_source_for_remux(self):
+        options, _ = self.resolve(str(self.source), "flac", "--no-input")
+
+        self.assertEqual(options.remux_sources, {self.source / "song.mka"})
+        copy_at = options.remux_args.index("-c:a")
+        self.assertEqual(options.remux_args[copy_at:copy_at + 2], ["-c:a", "copy"])
+
+    def test_bitrate_forces_a_real_encode(self):
+        options, _ = self.resolve(str(self.source), "flac", "--no-input",
+                                  "--bitrate", "320k")
+        self.assertEqual(options.remux_sources, set())
+
+    def test_sample_rate_forces_a_real_encode(self):
+        options, _ = self.resolve(str(self.source), "flac", "--no-input",
+                                  "--sample-rate", "22050")
+        self.assertEqual(options.remux_sources, set())
+
+    def test_probe_failure_falls_back_to_a_normal_encode(self):
+        original = aconv.probe_audio_codecs
+        aconv.probe_audio_codecs = lambda path: None
+        self.addCleanup(setattr, aconv, "probe_audio_codecs", original)
+
+        options, _ = self.resolve(str(self.source), "flac", "--no-input")
+
+        self.assertEqual(options.remux_sources, set())
+        self.assertEqual(options.convert_plan,
+                         [(self.source / "song.mka", self.tmp / "music_flac" / "song.flac")])
+
+    def test_dry_run_reports_the_remux(self):
+        result = run_aconv("music", "flac", "--dry-run", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("remuxing", result.stdout)
+        self.assertNotIn("converting", result.stdout)
+        self.assertFalse((self.tmp / "music_flac").exists(), "dry run created the destination")
 
 
 class InterruptTest(TempDirTestCase):

@@ -32,6 +32,24 @@ AUDIO_EXTENSIONS = {
 # .ogg defaults to theora, which is usually not built in).
 ART_CAPABLE_FORMATS = {'mp3', 'flac', 'm4a', 'm4b', 'mp4'}
 
+# Codecs each target container stores natively, so a matching source stream can
+# be remuxed with -c:a copy instead of decoded and re-encoded. A lossy codec
+# loses quality on every re-encode. Deliberately conservative: only pairings
+# every mainstream player accepts. mp3-in-mp4 is legal but widely unsupported,
+# and Ogg can carry FLAC and Opus but most software expects those under
+# .flac/.opus, so all of them get a normal encode instead.
+REMUX_CODECS = {
+    'mp3': {'mp3'},
+    'flac': {'flac'},
+    'opus': {'opus'},
+    'm4a': {'aac', 'alac'},
+    'm4b': {'aac', 'alac'},
+    'ogg': {'vorbis'},
+    # WAV is little-endian only; the big-endian and companded pcm variants
+    # would have to be converted anyway.
+    'wav': {'pcm_u8', 'pcm_s16le', 'pcm_s24le', 'pcm_s32le', 'pcm_f32le', 'pcm_f64le'},
+}
+
 # Verb and present participle for the three ways of handling files that are
 # already in the target format, keyed by the first letter of the choice.
 ON_EXISTING_WORDS = {'c': ('copy', 'copying'), 'm': ('move', 'moving'), 's': ('skip', 'skipping')}
@@ -119,6 +137,52 @@ def probe_duration(path):
     except ValueError:
         return None
     return duration if duration > 0 else None
+
+def probe_audio_codecs(path):
+    """Codec of every audio stream in `path`, or None if ffprobe cannot say."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a',
+             '-show_entries', 'stream=codec_name', '-of', 'default=nw=1:nk=1', str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    codecs = tuple(result.stdout.decode('utf-8', errors='replace').split())
+    return codecs or None
+
+def should_stream_copy(source_file, target_format):
+    """True when the audio in `source_file` already fits the target container.
+
+    Every audio stream has to match, not just the first: ffmpeg chooses which
+    stream to keep by its own heuristics, so a mixed-codec source could have
+    the wrong one copied into a container that cannot hold it. A failed probe
+    means a normal encode, slower but always safe, never a failed file.
+    """
+    codecs = REMUX_CODECS.get(target_format)
+    if not codecs:
+        return False
+    found = probe_audio_codecs(source_file)
+    return found is not None and all(codec in codecs for codec in found)
+
+def plan_remuxes(convert_plan, target_format, workers):
+    """The sources in `convert_plan` that can be remuxed instead of re-encoded.
+
+    Empty when ffprobe is missing or the target has no codec map: without a
+    trustworthy answer every file gets the normal encode.
+    """
+    if target_format not in REMUX_CODECS or not shutil.which('ffprobe'):
+        return set()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        tasks = {executor.submit(should_stream_copy, src, target_format): src
+                 for src, _ in convert_plan}
+        try:
+            return {src for task, src in tasks.items() if task.result()}
+        except KeyboardInterrupt:
+            # Same reason as run_conversions: the queue would otherwise drain.
+            for task in tasks:
+                task.cancel()
+            raise
 
 def measure_durations(files, workers):
     """Per-file durations, or None if any file cannot be measured.
@@ -210,7 +274,7 @@ def move_file(source_file, dest_file):
         raise
     os.unlink(source_file)
 
-def build_ffmpeg_args(args, target_format):
+def build_ffmpeg_args(args, target_format, stream_copy=False):
     """Translate CLI options into ffmpeg arguments."""
     extra = []
     # Keep embedded cover art where the target container supports it, and drop
@@ -219,6 +283,8 @@ def build_ffmpeg_args(args, target_format):
         extra.extend(['-c:v', 'copy'])
     else:
         extra.append('-vn')
+    if stream_copy:
+        extra.extend(['-c:a', 'copy'])
     extra.extend(['-map_metadata', '0'])
     if target_format == 'mp3':
         # id3v2.3 is far more widely readable than ffmpeg's id3v2.4 default.
@@ -301,8 +367,12 @@ def failure_reason(err):
     joined = "; ".join(lines)
     return joined if len(joined) <= 160 else lines[0]
 
-def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=None):
+def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=None,
+                    remux_sources=frozenset(), remux_args=None):
     """Convert every (source, destination) pair.
+
+    Sources in `remux_sources` run with `remux_args` instead of `extra_args`,
+    so a remux and an encode can share one batch, one bar and one summary.
 
     Returns (success_count, failures), the failures as (source, stderr) pairs.
     Each failure is also tqdm.write()n the moment it happens: on a long batch
@@ -324,7 +394,8 @@ def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=No
     success_count = 0
     failures = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        tasks = {executor.submit(convert_file, src, dst, extra_args): src
+        tasks = {executor.submit(convert_file, src, dst,
+                                 remux_args if src in remux_sources else extra_args): src
                  for src, dst in convert_plan}
         try:
             with tqdm(desc="Converting", **bar_args) as pbar:
@@ -508,8 +579,17 @@ def resolve_options(argv=None):
         if skipped:
             print(f"--skip-existing: leaving {skipped} existing output file(s) alone.")
 
+    # Any quality flag is a request to transform the audio, which -c:a copy
+    # would silently ignore; only an unqualified conversion may stream-copy.
+    if args.bitrate or args.quality is not None or args.sample_rate:
+        remux_sources = set()
+    else:
+        remux_sources = plan_remuxes(convert_plan, target_format, args.workers)
+
     return argparse.Namespace(
         dest_dir=dest_dir, target_format=target_format, extra_args=extra_args,
+        remux_sources=remux_sources,
+        remux_args=build_ffmpeg_args(args, target_format, stream_copy=True),
         choice=choice, keep_plan=keep_plan, convert_plan=convert_plan,
         dry_run=args.dry_run, workers=args.workers, bitrate=args.bitrate,
         quality=args.quality, sample_rate=args.sample_rate)
@@ -523,8 +603,11 @@ def execute(options):
         for source_file, dest_file in options.keep_plan:
             print(f"  {participle} {source_file} -> {dest_file}")
         for source_file, dest_file in options.convert_plan:
-            print(f"  converting {source_file} -> {dest_file}")
+            action = "remuxing" if source_file in options.remux_sources else "converting"
+            print(f"  {action} {source_file} -> {dest_file}")
         print(f"  ffmpeg options: {' '.join(options.extra_args)}")
+        if options.remux_sources:
+            print(f"  ffmpeg options (remuxed files): {' '.join(options.remux_args)}")
         print(f"\n{len(options.keep_plan)} file(s) to {verb}, {len(options.convert_plan)} to convert.")
         sys.exit(0)
 
@@ -545,6 +628,10 @@ def execute(options):
 
     print(f"Found {len(options.convert_plan)} audio files. Converting to .{options.target_format}...")
     print(f"Destination: {options.dest_dir}")
+    if options.remux_sources:
+        print(f"{len(options.remux_sources)} file(s) already hold audio the "
+              f".{options.target_format} container stores natively; "
+              "remuxing without re-encoding.")
     if options.bitrate or options.quality is not None or options.sample_rate:
         print(f"ffmpeg options: {' '.join(options.extra_args)}")
 
@@ -559,7 +646,8 @@ def execute(options):
         bar_args = dict(total=len(options.convert_plan), unit='file')
 
     success_count, failures = run_conversions(options.convert_plan, options.extra_args,
-                                              options.workers, weights, bar_args)
+                                              options.workers, weights, bar_args,
+                                              options.remux_sources, options.remux_args)
 
     print(f"\nConversion complete! {success_count}/{len(options.convert_plan)} "
           "files successfully converted.")
