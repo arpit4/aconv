@@ -88,8 +88,9 @@ def convert_file(source_file, dest_file, extra_args=None):
         # behind. Remove it, otherwise the next run sees a file that is already
         # in the target format and treats the broken output as finished work.
         try:
-            dest_file.unlink(missing_ok=True)
+            dest_file.unlink()
         except OSError:
+            # Nothing was written, or it is not ours to delete.
             pass
         err = e.stderr.decode('utf-8', errors='replace').strip()
         return False, f"Failed to convert {source_file}: {err}"
@@ -270,14 +271,14 @@ def main():
             print("Non-interactive run: skipping files already in the target format.")
         else:
             while True:
-                answer = prompt(f"\nWould you like to [c]opy, [m]ove, or [s]kip these files to the destination? ", 's')
+                answer = prompt(f"\nWould you like to [c]opy, [m]ove, or [s]kip these files to the destination? ", 's').lower()
                 if answer in ['c', 'm', 's', 'copy', 'move', 'skip']:
                     choice = answer
                     break
 
         if choice.startswith('m'):
             # Moving deletes the originals; require explicit confirmation.
-            confirm = prompt(f"This will MOVE (remove) {len(already_in_format)} original file(s). Type 'yes' to proceed: ", '')
+            confirm = prompt(f"This will MOVE (remove) {len(already_in_format)} original file(s). Type 'yes' to proceed: ", '').lower()
             if confirm != 'yes':
                 print("Move cancelled; skipping these files.")
                 choice = 's'

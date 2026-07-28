@@ -6,14 +6,22 @@ needs no binary test files. Run with:
     python3 -m unittest test_aconv -v
 """
 
+import os
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 import aconv
+
+try:
+    import pty
+except ImportError:  # Windows
+    pty = None
 
 ACONV = str(Path(__file__).parent / "aconv.py")
 HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
@@ -50,6 +58,41 @@ def run_aconv(*cli_args, cwd):
     """Run the CLI without a TTY, the way a script or CI job would."""
     return subprocess.run([sys.executable, ACONV, *cli_args], cwd=str(cwd),
                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+
+
+def run_aconv_interactive(*cli_args, cwd, feed, timeout=60):
+    """Run the CLI on a pty so the interactive prompts are actually exercised.
+
+    A pty never reports EOF on its own, so `feed` must end with EOT ("\\x04")
+    to exercise the closed-stdin path. The deadline turns a prompt that is
+    waiting for input nobody will send into a failure rather than a hang.
+    """
+    master, slave = pty.openpty()
+    process = subprocess.Popen([sys.executable, ACONV, *cli_args], cwd=str(cwd),
+                               stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    output = b""
+    deadline = time.monotonic() + timeout
+    try:
+        os.write(master, feed.encode())
+        while time.monotonic() < deadline:
+            if not select.select([master], [], [], 1.0)[0]:
+                continue
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break  # the child closed its end of the pty
+            if not chunk:
+                break
+            output += chunk
+        else:
+            process.kill()
+            raise AssertionError(
+                f"aconv did not finish within {timeout}s. Output so far:\n"
+                + output.decode("utf-8", errors="replace"))
+    finally:
+        os.close(master)
+    return process.wait(timeout=30), output.decode("utf-8", errors="replace")
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -211,6 +254,63 @@ class ConversionTest(TempDirTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skipping files already in the target format", result.stdout)
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+@unittest.skipUnless(pty is not None, "pty is not available on this platform")
+class InteractiveExistingFilesTest(TempDirTestCase):
+    """The copy and move paths for files already in the target format.
+
+    These need a TTY, and they are where the destination collision used to
+    destroy the very file the user asked to keep.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.source = self.tmp / "music"
+        self.source.mkdir()
+        make_tone(self.source / "song.wav", frequency=440)
+        make_tone(self.source / "song.mp3", frequency=660)
+        self.original = (self.source / "song.mp3").read_bytes()
+
+    def test_copied_original_is_not_overwritten_by_a_conversion(self):
+        # Uppercase on purpose: the answers are case-insensitive.
+        code, output = run_aconv_interactive("music", "mp3", cwd=self.tmp, feed="\nC\n")
+
+        self.assertEqual(code, 0, output)
+        dest = self.tmp / "music_mp3"
+        self.assertEqual(sorted(p.name for p in dest.iterdir()),
+                         ["song.mp3", "song_wav.mp3"])
+        self.assertEqual((dest / "song.mp3").read_bytes(), self.original,
+                         "the copied original was overwritten by a conversion")
+
+    def test_moved_original_survives(self):
+        code, output = run_aconv_interactive("music", "mp3", cwd=self.tmp, feed="\nM\nYES\n")
+
+        self.assertEqual(code, 0, output)
+        dest = self.tmp / "music_mp3"
+        self.assertEqual(sorted(p.name for p in dest.iterdir()),
+                         ["song.mp3", "song_wav.mp3"])
+        self.assertEqual((dest / "song.mp3").read_bytes(), self.original,
+                         "the moved original was overwritten and is now lost")
+        self.assertFalse((self.source / "song.mp3").exists(), "move left the original in place")
+
+    def test_move_without_confirmation_falls_back_to_skip(self):
+        code, output = run_aconv_interactive("music", "mp3", cwd=self.tmp, feed="\nm\nno\n")
+
+        self.assertEqual(code, 0, output)
+        self.assertIn("Move cancelled", output)
+        self.assertTrue((self.source / "song.mp3").exists(), "a cancelled move removed the original")
+        self.assertEqual(sorted(p.name for p in (self.tmp / "music_mp3").iterdir()), ["song.mp3"])
+
+    def test_closed_stdin_on_a_tty_does_not_traceback(self):
+        # EOT at a prompt is what raised an unhandled EOFError before. One EOT
+        # ends one read, so send one for each of the two prompts on this path.
+        code, output = run_aconv_interactive("music", "mp3", cwd=self.tmp, feed="\x04\x04")
+
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn("EOFError", output)
+        self.assertEqual(code, 0, output)
 
 
 class CliValidationTest(TempDirTestCase):
