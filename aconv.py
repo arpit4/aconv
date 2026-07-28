@@ -1,8 +1,10 @@
 import argparse
+import errno
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -170,6 +172,43 @@ def convert_file(source_file, dest_file, extra_args=None):
             pass
         err = e.stderr.decode('utf-8', errors='replace').strip()
         return False, f"Failed to convert {source_file}: {err}"
+
+def move_file(source_file, dest_file):
+    """Move `source_file` onto `dest_file` without a moment where neither exists.
+
+    shutil.move degrades to copy-then-delete across filesystems, so an
+    interrupt mid-move can lose the file: already gone from the source, not
+    yet whole at the destination. Same filesystem gets the atomic rename;
+    across filesystems the copy is staged under a temporary name, synced to
+    disk, renamed into place, and only then is the source removed. Every
+    interruption leaves either the intact source or a complete destination.
+    """
+    try:
+        os.replace(source_file, dest_file)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    # Staged in the destination directory, so the final rename cannot itself
+    # cross a filesystem boundary.
+    fd, tmp_name = tempfile.mkstemp(dir=dest_file.parent,
+                                    prefix=f".{dest_file.name}.", suffix=".partial")
+    try:
+        with open(source_file, 'rb') as src, open(fd, 'wb') as tmp:
+            shutil.copyfileobj(src, tmp)
+            tmp.flush()
+            # Force the copy to disk before it can take the final name: a
+            # rename can survive a crash that the data it points to did not.
+            os.fsync(tmp.fileno())
+        shutil.copystat(source_file, tmp_name)
+        os.replace(tmp_name, dest_file)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    os.unlink(source_file)
 
 def build_ffmpeg_args(args, target_format):
     """Translate CLI options into ffmpeg arguments."""
@@ -475,7 +514,7 @@ def execute(options):
             if options.choice.startswith('c'):
                 shutil.copy2(source_file, dest_file)
             else:
-                shutil.move(str(source_file), str(dest_file))
+                move_file(source_file, dest_file)
         print("Done.")
 
     if not options.convert_plan:

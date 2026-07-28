@@ -8,6 +8,7 @@ needs no binary test files. Run with:
 
 import argparse
 import contextlib
+import errno
 import io
 import os
 import select
@@ -323,6 +324,71 @@ class ExecuteTest(TempDirTestCase):
         self.assertEqual(code, 0)
         self.assertFalse((self.tmp / "out").exists(), "dry run created the destination")
         self.assertIn("1 file(s) to copy, 1 to convert.", output)
+
+
+class AtomicMoveTest(TempDirTestCase):
+    """The cross-filesystem branch of the move pass.
+
+    shutil.move degrades to copy-then-delete when the destination sits on
+    another filesystem, so an interrupt mid-move used to lose the file: gone
+    from the source, half-written at the destination. os.replace cannot cross
+    filesystems in a test, so the EXDEV refusal is injected instead.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.source = self.tmp / "song.mp3"
+        self.source.write_bytes(b"original")
+        self.dest_dir = self.tmp / "out"
+        self.dest_dir.mkdir()
+        self.dest = self.dest_dir / "song.mp3"
+
+    def force_exdev(self):
+        """Make the first os.replace fail the way a cross-device rename does."""
+        real_replace = os.replace
+        calls = []
+
+        def cross_device_replace(src, dst):
+            if not calls:
+                calls.append(src)
+                raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+            return real_replace(src, dst)
+
+        os.replace = cross_device_replace
+        self.addCleanup(setattr, os, "replace", real_replace)
+        return calls
+
+    def test_cross_filesystem_move_completes(self):
+        calls = self.force_exdev()
+
+        aconv.move_file(self.source, self.dest)
+
+        self.assertEqual(len(calls), 1, "the EXDEV fallback was never exercised")
+        self.assertEqual(self.dest.read_bytes(), b"original")
+        self.assertFalse(self.source.exists(), "move left the original in place")
+        self.assertEqual([p.name for p in self.dest_dir.iterdir()], ["song.mp3"],
+                         "the staging file was left behind")
+
+    def test_interrupted_copy_keeps_the_source_and_no_half_destination(self):
+        self.force_exdev()
+
+        def interrupted_copy(fsrc, fdst, length=0):
+            # Write part of the data first, so that a leaked staging file
+            # would be a half-file rather than an empty one.
+            fdst.write(b"orig")
+            raise KeyboardInterrupt
+
+        real_copy = shutil.copyfileobj
+        shutil.copyfileobj = interrupted_copy
+        self.addCleanup(setattr, shutil, "copyfileobj", real_copy)
+
+        with self.assertRaises(KeyboardInterrupt):
+            aconv.move_file(self.source, self.dest)
+
+        self.assertEqual(self.source.read_bytes(), b"original", "the source was damaged")
+        self.assertFalse(self.dest.exists(), "a half-file appeared under the final name")
+        self.assertEqual(list(self.dest_dir.iterdir()), [],
+                         "the staging file was not cleaned up")
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
