@@ -284,7 +284,15 @@ def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=No
             raise
     return success_count
 
-def main():
+def resolve_options(argv=None):
+    """Resolve the command line into a run plan, prompting where needed.
+
+    Everything up to the first filesystem write is decided here: source
+    files, destination, ffmpeg arguments, and what happens to files already
+    in the target format. That keeps the decision logic testable without a
+    terminal. Returns a namespace with what execute() needs; exits on
+    validation failures exactly as the CLI reports them.
+    """
     parser = argparse.ArgumentParser(description="Offline Audio Format Converter")
     parser.add_argument("--version", action="version", version=f"aconv {__version__}")
     parser.add_argument("source", nargs='?', help="Source directory or file")
@@ -312,7 +320,7 @@ def main():
     parser.add_argument("--no-input", dest="no_input", action="store_true",
                         help="Never prompt; use the defaults and fail if a required value is missing")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.workers < 1:
         print("Error: --workers must be a positive integer.")
@@ -439,55 +447,69 @@ def main():
         if skipped:
             print(f"--skip-existing: leaving {skipped} existing output file(s) alone.")
 
-    if args.dry_run:
-        verb, participle = ON_EXISTING_WORDS[choice[0]]
-        print(f"\nDry run. Nothing will be written to {dest_dir}.")
-        for source_file, dest_file in keep_plan:
+    return argparse.Namespace(
+        dest_dir=dest_dir, target_format=target_format, extra_args=extra_args,
+        choice=choice, keep_plan=keep_plan, convert_plan=convert_plan,
+        dry_run=args.dry_run, workers=args.workers, bitrate=args.bitrate,
+        quality=args.quality, sample_rate=args.sample_rate)
+
+def execute(options):
+    """Carry out a plan from resolve_options(): the dry-run report, the copy
+    or move pass, and the conversion run."""
+    if options.dry_run:
+        verb, participle = ON_EXISTING_WORDS[options.choice[0]]
+        print(f"\nDry run. Nothing will be written to {options.dest_dir}.")
+        for source_file, dest_file in options.keep_plan:
             print(f"  {participle} {source_file} -> {dest_file}")
-        for source_file, dest_file in convert_plan:
+        for source_file, dest_file in options.convert_plan:
             print(f"  converting {source_file} -> {dest_file}")
-        print(f"  ffmpeg options: {' '.join(extra_args)}")
-        print(f"\n{len(keep_plan)} file(s) to {verb}, {len(convert_plan)} to convert.")
+        print(f"  ffmpeg options: {' '.join(options.extra_args)}")
+        print(f"\n{len(options.keep_plan)} file(s) to {verb}, {len(options.convert_plan)} to convert.")
         sys.exit(0)
 
-    if keep_plan:
-        action_name = "Copying" if choice.startswith('c') else "Moving"
-        print(f"{action_name} {len(keep_plan)} files to {dest_dir}...")
-        for source_file, dest_file in keep_plan:
+    if options.keep_plan:
+        action_name = "Copying" if options.choice.startswith('c') else "Moving"
+        print(f"{action_name} {len(options.keep_plan)} files to {options.dest_dir}...")
+        for source_file, dest_file in options.keep_plan:
             dest_file.parent.mkdir(parents=True, exist_ok=True)
-            if choice.startswith('c'):
+            if options.choice.startswith('c'):
                 shutil.copy2(source_file, dest_file)
             else:
                 shutil.move(str(source_file), str(dest_file))
         print("Done.")
 
-    if not convert_plan:
+    if not options.convert_plan:
         print("\nNo files left to convert.")
         sys.exit(0)
 
-    print(f"Found {len(convert_plan)} audio files. Converting to .{target_format}...")
-    print(f"Destination: {dest_dir}")
-    if args.bitrate or args.quality is not None or args.sample_rate:
-        print(f"ffmpeg options: {' '.join(extra_args)}")
+    print(f"Found {len(options.convert_plan)} audio files. Converting to .{options.target_format}...")
+    print(f"Destination: {options.dest_dir}")
+    if options.bitrate or options.quality is not None or options.sample_rate:
+        print(f"ffmpeg options: {' '.join(options.extra_args)}")
 
     # Weight the bar by audio length where possible, so that one long podcast
     # among short tracks does not make the bar stall near the end.
-    durations = measure_durations([src for src, _ in convert_plan], args.workers)
+    durations = measure_durations([src for src, _ in options.convert_plan], options.workers)
     if durations:
-        weights = {src: seconds for (src, _), seconds in zip(convert_plan, durations)}
+        weights = {src: seconds for (src, _), seconds in zip(options.convert_plan, durations)}
         bar_args = dict(total=sum(durations), unit='s', unit_scale=True)
     else:
         weights = None
-        bar_args = dict(total=len(convert_plan), unit='file')
+        bar_args = dict(total=len(options.convert_plan), unit='file')
 
-    success_count = run_conversions(convert_plan, extra_args, args.workers, weights, bar_args)
+    success_count = run_conversions(options.convert_plan, options.extra_args,
+                                    options.workers, weights, bar_args)
 
-    failed_count = len(convert_plan) - success_count
-    print(f"\nConversion complete! {success_count}/{len(convert_plan)} files successfully converted.")
+    failed_count = len(options.convert_plan) - success_count
+    print(f"\nConversion complete! {success_count}/{len(options.convert_plan)} "
+          "files successfully converted.")
     if failed_count:
         # Exit non-zero so scripts and CI notice a partially failed batch.
         print(f"{failed_count} file(s) failed to convert.")
         sys.exit(1)
+
+def main():
+    execute(resolve_options())
 
 if __name__ == "__main__":
     try:

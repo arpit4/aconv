@@ -6,6 +6,9 @@ needs no binary test files. Run with:
     python3 -m unittest test_aconv -v
 """
 
+import argparse
+import contextlib
+import io
 import os
 import select
 import shutil
@@ -172,6 +175,154 @@ class PlanDestinationsTest(TempDirTestCase):
         _, convert_plan = aconv.plan_destinations(source, self.tmp / "out", [], [track], "mp3")
 
         self.assertEqual(convert_plan, [(track, self.tmp / "out" / "album" / "track.mp3")])
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+class ResolveOptionsTest(TempDirTestCase):
+    """The copy/move/skip decision and destination resolution, in-process.
+
+    resolve_options() only inspects names and paths, nothing is converted,
+    so empty files are enough, but check_ffmpeg() still runs inside it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # macOS keeps temporary directories behind a /var -> /private/var
+        # symlink, and resolve_options() resolves the paths it is given, so
+        # resolve ours too or none of the path assertions would compare equal.
+        self.tmp = self.tmp.resolve()
+        self.source = self.tmp / "music"
+        self.source.mkdir()
+        (self.source / "song.wav").touch()
+        (self.source / "song.mp3").touch()
+
+    def resolve(self, *cli_args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            options = aconv.resolve_options(list(cli_args))
+        return options, out.getvalue()
+
+    def test_on_existing_copy_reserves_the_kept_destination(self):
+        options, _ = self.resolve(str(self.source), "mp3", "--on-existing", "copy")
+
+        dest = self.tmp / "music_mp3"
+        self.assertEqual(options.choice, 'c')
+        self.assertEqual(options.keep_plan, [(self.source / "song.mp3", dest / "song.mp3")])
+        self.assertEqual(options.convert_plan,
+                         [(self.source / "song.wav", dest / "song_wav.mp3")])
+
+    def test_on_existing_move_needs_no_confirmation(self):
+        options, _ = self.resolve(str(self.source), "mp3", "--on-existing", "move")
+
+        self.assertEqual(options.choice, 'm')
+        self.assertEqual(options.keep_plan,
+                         [(self.source / "song.mp3", self.tmp / "music_mp3" / "song.mp3")])
+
+    def test_on_existing_skip_reserves_nothing(self):
+        options, _ = self.resolve(str(self.source), "mp3", "--on-existing", "skip")
+
+        self.assertEqual(options.choice, 's')
+        self.assertEqual(options.keep_plan, [])
+        self.assertEqual(options.convert_plan,
+                         [(self.source / "song.wav", self.tmp / "music_mp3" / "song.mp3")])
+
+    def test_no_input_defaults_to_skip(self):
+        options, output = self.resolve(str(self.source), "mp3", "--no-input")
+
+        self.assertEqual(options.choice, 's')
+        self.assertIn("skipping files already in the target format", output)
+
+    def test_default_destination_sits_beside_the_source(self):
+        options, _ = self.resolve(str(self.source), "mp3", "--no-input")
+        self.assertEqual(options.dest_dir, self.tmp / "music_mp3")
+
+    def test_a_file_source_names_its_destination_after_the_file(self):
+        track = self.tmp / "loose.wav"
+        track.touch()
+
+        options, _ = self.resolve(str(track), "mp3", "--no-input")
+
+        self.assertEqual(options.dest_dir, self.tmp / "loose_mp3")
+        self.assertEqual(options.convert_plan, [(track, self.tmp / "loose_mp3" / "loose.mp3")])
+
+    def test_dest_flag_overrides_the_default(self):
+        options, _ = self.resolve(str(self.source), "mp3",
+                                  "--dest", str(self.tmp / "elsewhere"), "--no-input")
+        self.assertEqual(options.dest_dir, self.tmp / "elsewhere")
+
+    def test_skip_existing_filters_both_plans(self):
+        dest = self.tmp / "music_mp3"
+        dest.mkdir()
+        (dest / "song.mp3").touch()
+
+        options, output = self.resolve(str(self.source), "mp3",
+                                       "--on-existing", "copy", "--skip-existing")
+
+        self.assertEqual(options.keep_plan, [])
+        self.assertEqual(options.convert_plan,
+                         [(self.source / "song.wav", dest / "song_wav.mp3")])
+        self.assertIn("leaving 1 existing output file(s) alone", output)
+
+
+class ExecuteTest(TempDirTestCase):
+    """The copy/move pass and the dry-run report, in-process.
+
+    Plans are built by hand so no ffmpeg is needed: an empty convert plan
+    makes execute() stop right after the pass under test.
+    """
+
+    def options(self, **overrides):
+        base = dict(dest_dir=self.tmp / "out", target_format="mp3", extra_args=[],
+                    choice='s', keep_plan=[], convert_plan=[], dry_run=False,
+                    workers=1, bitrate=None, quality=None, sample_rate=None)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def execute(self, options):
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as caught, contextlib.redirect_stdout(out):
+            aconv.execute(options)
+        return caught.exception.code, out.getvalue()
+
+    def test_copy_pass_keeps_the_original(self):
+        source = self.tmp / "song.mp3"
+        source.write_bytes(b"original")
+        options = self.options(choice='c',
+                               keep_plan=[(source, self.tmp / "out" / "song.mp3")])
+
+        code, output = self.execute(options)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Copying 1 files", output)
+        self.assertEqual((self.tmp / "out" / "song.mp3").read_bytes(), b"original")
+        self.assertTrue(source.exists(), "copy removed the original")
+
+    def test_move_pass_removes_the_original(self):
+        source = self.tmp / "song.mp3"
+        source.write_bytes(b"original")
+        options = self.options(choice='m',
+                               keep_plan=[(source, self.tmp / "out" / "song.mp3")])
+
+        code, output = self.execute(options)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Moving 1 files", output)
+        self.assertEqual((self.tmp / "out" / "song.mp3").read_bytes(), b"original")
+        self.assertFalse(source.exists(), "move left the original in place")
+
+    def test_dry_run_writes_nothing(self):
+        source = self.tmp / "song.mp3"
+        source.write_bytes(b"original")
+        options = self.options(choice='c', dry_run=True,
+                               keep_plan=[(source, self.tmp / "out" / "song.mp3")],
+                               convert_plan=[(self.tmp / "song.wav",
+                                              self.tmp / "out" / "song_wav.mp3")])
+
+        code, output = self.execute(options)
+
+        self.assertEqual(code, 0)
+        self.assertFalse((self.tmp / "out").exists(), "dry run created the destination")
+        self.assertIn("1 file(s) to copy, 1 to convert.", output)
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
