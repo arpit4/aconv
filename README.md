@@ -1,6 +1,9 @@
 # Offline Audio File Format Converter
 
-A fast, interactive, and offline command-line tool for converting audio files between formats (e.g., `.m4a` to `.mp3`) using `ffmpeg`. It maintains your folder structure, processes files in parallel for maximum speed, and handles pre-existing target formats elegantly.
+A fast, offline command-line tool for converting audio files between formats
+(e.g. `.m4a` to `.mp3`) using `ffmpeg`. It mirrors your folder structure, converts
+files in parallel, and never lets one output quietly overwrite another. Works
+interactively or unattended from cron and CI.
 
 ## Features
 
@@ -9,7 +12,7 @@ A fast, interactive, and offline command-line tool for converting audio files be
 - **Quality Control**: Set bitrate, VBR quality, and sample rate via flags.
 - **Smart Directory Handling**: Replicates the original folder structure in the destination.
 - **Collision-Safe**: Files that would map to the same output name (e.g. `song.wav` and `song.flac` both mapping to `song.mp3`) are disambiguated instead of silently overwritten. Comparison is case-insensitive, so `SONG.wav` and `song.flac` are also kept apart on macOS and Windows.
-- **Existing File Detection**: Automatically detects files that are already in the target format and offers to copy, move, or skip them without re-encoding (moves require explicit confirmation). Copied and moved files reserve their destination first, so a conversion can never overwrite one.
+- **Existing File Detection**: Automatically detects files that are already in the target format and offers to copy, move, or skip them without re-encoding. Copied and moved files reserve their destination first, so a conversion can never overwrite one.
 - **Tags and Cover Art**: Metadata is carried over, and embedded cover art is kept whenever the target container supports it.
 - **Honest Exit Status**: Exits non-zero if any file failed, and never leaves a truncated output file behind.
 - **Format Filtering**: Optionally filter conversions to a specific source extension.
@@ -18,11 +21,13 @@ A fast, interactive, and offline command-line tool for converting audio files be
 
 ## Requirements
 
-1. **Python 3.x**
+1. **Python 3.7 or newer** (no third-party packages beyond `tqdm`).
 2. **ffmpeg**: Must be installed and accessible in your system's PATH.
    - macOS: `brew install ffmpeg`
    - Linux: `sudo apt install ffmpeg`
    - Windows: Install via `winget install ffmpeg` or download from [ffmpeg.org](https://ffmpeg.org).
+   - `ffprobe`, which ships alongside ffmpeg, is used to weight the progress bar
+     by audio length. Without it the bar simply counts files instead.
 3. **Python Packages**:
    - Install dependencies using `pip install -r requirements.txt` (currently requires `tqdm`).
 
@@ -42,30 +47,44 @@ A fast, interactive, and offline command-line tool for converting audio files be
 
 ## Usage
 
-### Interactive Mode
-The easiest way to use the tool is to run it without arguments:
+The two positional arguments are the source and the target format:
+
+```bash
+python3 aconv.py <source> <format> [options]
+```
+
+The source is a directory or a single file. Anything you leave out is asked for,
+so running with no arguments walks you through it:
+
 ```bash
 python3 aconv.py
 ```
-You will be prompted to enter the source directory, target format, and any specific extensions to filter.
 
-### Command-Line Arguments
-For automation, you can provide arguments directly:
+### Examples
 
-**Convert a single folder to mp3:**
+**Convert a folder to mp3:**
 ```bash
 python3 aconv.py /path/to/my_music mp3
 ```
-*(This creates a new folder named `my_music_mp3` next to `my_music` and converts everything inside).*
-
-**Convert to wav and specify a custom destination:**
-```bash
-python3 aconv.py /path/to/my_music wav --dest /path/to/destination_folder
-```
+*(Creates a new folder named `my_music_mp3` next to `my_music`, mirroring its
+directory tree. Files already in mp3 are handled separately, see below.)*
 
 **Convert a single file:**
 ```bash
 python3 aconv.py /path/to/song.m4a flac
+```
+*(Writes `song_flac/song.flac`. A file you name directly is converted whatever
+its extension, since ffmpeg reads more containers than a folder scan looks for.)*
+
+**Choose the destination, or convert in place:**
+```bash
+python3 aconv.py /path/to/my_music wav --dest /path/to/destination_folder
+python3 aconv.py /path/to/my_music wav --dest /path/to/my_music
+```
+
+**Only convert the `.m4a` files in a mixed folder:**
+```bash
+python3 aconv.py /path/to/my_music mp3 --ext m4a
 ```
 
 **Convert to 320k CBR mp3 with 4 workers:**
@@ -88,23 +107,35 @@ python3 aconv.py /path/to/my_music mp3 --dry-run
 python3 aconv.py /path/to/my_music mp3 --skip-existing
 ```
 
-### Unattended Runs
+### Files Already in the Target Format
 
-Nothing prompts when there is no terminal, so the tool is safe to run from cron
-or CI. On a terminal, a fully specified command line runs as given; the optional
-extension filter is only offered when you are already being prompted for the
-source and format. Two flags cover the rest:
+Converting a folder to mp3 when some of it is already mp3 would mean re-encoding
+lossy audio, so those files are set aside and you choose what happens to them:
+`copy` them across, `move` them (which removes the originals), or `skip` them.
+
+On a terminal you are asked. `--on-existing` answers up front instead:
 
 ```bash
-# Decide up front what happens to files already in the target format
 python3 aconv.py /path/to/my_music mp3 --on-existing copy
-
-# Belt and braces: refuse to prompt at all, even on a terminal
-python3 aconv.py /path/to/my_music mp3 --no-input
 ```
 
-`--on-existing move` needs no confirmation, because passing the flag *is* the
-confirmation. Without it, an interactive move still asks.
+An interactive `move` asks for a typed confirmation first. `--on-existing move`
+does not, because passing the flag is itself the confirmation.
+
+### Unattended Runs
+
+Nothing prompts when there is no terminal, so cron and CI runs never stall: the
+tool converts every audio file it finds and skips anything already in the target
+format. Pass `source` and `format` as arguments, and `--on-existing` if skipping
+is not what you want.
+
+On a terminal, a fully specified command line also runs as given. The optional
+extension filter is only offered when you are already being prompted for the
+source and format. To rule prompts out entirely, even on a terminal:
+
+```bash
+python3 aconv.py /path/to/my_music mp3 --no-input
+```
 
 ### Options
 
@@ -128,10 +159,18 @@ confirmation. Without it, an interactive move still asks.
 
 ## How It Works
 
-1. Scans the source path for audio files (e.g., `.m4a`, `.wav`, `.flac`).
-2. Checks if any files are already in the target format. If so, you'll be prompted to copy, move, or skip them.
-3. Spawns an `ffmpeg` subprocess for each file needing conversion, executing them in parallel.
-4. Outputs the converted files into the destination folder, mimicking the original directory tree.
+1. Scans the source for audio files, skipping the destination if it sits inside
+   the source tree. A single named file is taken as-is.
+2. Sets aside anything already in the target format, to be copied, moved or
+   skipped rather than re-encoded.
+3. Maps every remaining file to a destination path, mirroring the source tree.
+   Two files that would land on the same name are disambiguated, and the copied
+   or moved files claim their paths first so a conversion cannot overwrite one.
+4. Measures the audio length of each file with `ffprobe`, to weight the progress
+   bar. If any file cannot be measured, the bar counts files instead.
+5. Runs one `ffmpeg` process per file, several at a time. A conversion that fails
+   has its half-written output removed, and the run finishes with a non-zero exit
+   status.
 
 ## Notes
 
@@ -140,10 +179,6 @@ confirmation. Without it, an interactive move still asks.
   recent ffmpeg defaults the `.ogg` container to the **FLAC** codec (lossless), in
   which case `--bitrate` has no effect. Prefer an extension that maps unambiguously
   to your intended codec (e.g. `.mp3`, `.opus`) when bitrate matters.
-- **Non-interactive use.** When run without a terminal (scripts, CI, piped input),
-  the tool does not prompt: it converts all audio files and skips any already in the
-  target format. Provide `source` and `format` as arguments in that case, and see
-  [Unattended Runs](#unattended-runs) for `--on-existing` and `--no-input`.
 - **Which files a directory scan picks up.** Audio-only containers (`.mp3`, `.m4a`,
   `.flac`, `.wav`, `.ogg`, `.opus`, `.aiff`, `.mka`, `.wv`, `.ape` and friends), so
   that scanning a folder of home videos does not quietly rip their soundtracks. A
