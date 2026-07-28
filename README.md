@@ -13,7 +13,8 @@ A fast, interactive, and offline command-line tool for converting audio files be
 - **Tags and Cover Art**: Metadata is carried over, and embedded cover art is kept whenever the target container supports it.
 - **Honest Exit Status**: Exits non-zero if any file failed, and never leaves a truncated output file behind.
 - **Format Filtering**: Optionally filter conversions to a specific source extension.
-- **Clean Progress Bar**: Shows conversion progress via `tqdm`.
+- **Scriptable**: `--dry-run`, `--skip-existing`, `--on-existing` and `--no-input` mean cron and CI never hit a prompt.
+- **Clean Progress Bar**: Shows conversion progress via `tqdm`, weighted by audio length so a long podcast does not stall the bar.
 
 ## Requirements
 
@@ -77,6 +78,34 @@ python3 aconv.py /path/to/my_music mp3 --bitrate 320k --workers 4
 python3 aconv.py /path/to/my_music mp3 --quality 2 --sample-rate 44100
 ```
 
+**See the plan without writing anything:**
+```bash
+python3 aconv.py /path/to/my_music mp3 --dry-run
+```
+
+**Resume an interrupted run, leaving finished outputs alone:**
+```bash
+python3 aconv.py /path/to/my_music mp3 --skip-existing
+```
+
+### Unattended Runs
+
+Nothing prompts when there is no terminal, so the tool is safe to run from cron
+or CI. On a terminal, a fully specified command line runs as given; the optional
+extension filter is only offered when you are already being prompted for the
+source and format. Two flags cover the rest:
+
+```bash
+# Decide up front what happens to files already in the target format
+python3 aconv.py /path/to/my_music mp3 --on-existing copy
+
+# Belt and braces: refuse to prompt at all, even on a terminal
+python3 aconv.py /path/to/my_music mp3 --no-input
+```
+
+`--on-existing move` needs no confirmation, because passing the flag *is* the
+confirmation. Without it, an interactive move still asks.
+
 ### Options
 
 | Flag | Description | Default |
@@ -87,6 +116,10 @@ python3 aconv.py /path/to/my_music mp3 --quality 2 --sample-rate 44100
 | `--bitrate` | Target audio bitrate / CBR (e.g. `320k`). Cannot be combined with `--quality` | ffmpeg default |
 | `--quality` | VBR quality (ffmpeg `-q:a`, e.g. `2` for mp3). Cannot be combined with `--bitrate` | ffmpeg default |
 | `--sample-rate` | Target sample rate in Hz (e.g. `44100`) | source rate |
+| `--on-existing` | `copy`, `move` or `skip` files already in the target format, without prompting | prompt on a terminal, otherwise `skip` |
+| `--skip-existing` | Leave outputs that already exist alone instead of re-encoding them | re-encode everything |
+| `--dry-run` | Print the plan and exit without writing anything | off |
+| `--no-input` | Never prompt; use the defaults and fail if a required value is missing | off |
 
 ### Exit Status
 
@@ -109,7 +142,15 @@ python3 aconv.py /path/to/my_music mp3 --quality 2 --sample-rate 44100
   to your intended codec (e.g. `.mp3`, `.opus`) when bitrate matters.
 - **Non-interactive use.** When run without a terminal (scripts, CI, piped input),
   the tool does not prompt: it converts all audio files and skips any already in the
-  target format. Provide `source` and `format` as arguments in that case.
+  target format. Provide `source` and `format` as arguments in that case, and see
+  [Unattended Runs](#unattended-runs) for `--on-existing` and `--no-input`.
+- **Which files a directory scan picks up.** Audio-only containers (`.mp3`, `.m4a`,
+  `.flac`, `.wav`, `.ogg`, `.opus`, `.aiff`, `.mka`, `.wv`, `.ape` and friends), so
+  that scanning a folder of home videos does not quietly rip their soundtracks. A
+  file named directly on the command line is converted whatever its extension, since
+  ffmpeg reads far more containers than that list covers.
+- **A destination inside the source tree is excluded from the scan**, so re-running
+  the same command does not start converting its own output.
 - **Cover art.** Art is copied as-is into `.mp3`, `.flac`, `.m4a`, `.m4b` and `.mp4`
   outputs. For any other target it is dropped, because ffmpeg would otherwise try to
   re-encode the picture with the container's default video codec and fail (converting

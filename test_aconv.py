@@ -257,6 +257,124 @@ class ConversionTest(TempDirTestCase):
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+class ScriptableFlagsTest(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.source = self.tmp / "music"
+        self.source.mkdir()
+        make_tone(self.source / "song.wav", frequency=440)
+        make_tone(self.source / "song.mp3", frequency=660)
+        self.original = (self.source / "song.mp3").read_bytes()
+
+    def test_on_existing_copy_without_a_tty(self):
+        result = run_aconv("music", "mp3", "--on-existing", "copy", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        dest = self.tmp / "music_mp3"
+        self.assertEqual(sorted(p.name for p in dest.iterdir()), ["song.mp3", "song_wav.mp3"])
+        self.assertEqual((dest / "song.mp3").read_bytes(), self.original)
+
+    def test_on_existing_move_needs_no_confirmation(self):
+        """A script cannot answer a confirmation prompt, so the flag is the consent."""
+        result = run_aconv("music", "mp3", "--on-existing", "move", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse((self.source / "song.mp3").exists())
+        self.assertEqual((self.tmp / "music_mp3" / "song.mp3").read_bytes(), self.original)
+
+    def test_dry_run_writes_nothing(self):
+        result = run_aconv("music", "mp3", "--on-existing", "copy", "--dry-run", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse((self.tmp / "music_mp3").exists(), "dry run created the destination")
+        self.assertIn("copying", result.stdout)
+        self.assertIn("converting", result.stdout)
+        self.assertIn("song_wav.mp3", result.stdout)
+
+    def test_skip_existing_leaves_finished_outputs_alone(self):
+        first = run_aconv("music", "mp3", cwd=self.tmp)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        output = self.tmp / "music_mp3" / "song.mp3"
+        output.write_bytes(b"sentinel")
+
+        second = run_aconv("music", "mp3", "--skip-existing", cwd=self.tmp)
+
+        self.assertEqual(second.returncode, 0, second.stdout)
+        self.assertIn("--skip-existing", second.stdout)
+        self.assertEqual(output.read_bytes(), b"sentinel", "an existing output was re-encoded")
+
+    def test_skip_existing_also_covers_copies(self):
+        first = run_aconv("music", "mp3", "--on-existing", "copy", cwd=self.tmp)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        copied = self.tmp / "music_mp3" / "song.mp3"
+        copied.write_bytes(b"sentinel")
+
+        second = run_aconv("music", "mp3", "--on-existing", "copy", "--skip-existing", cwd=self.tmp)
+
+        self.assertEqual(second.returncode, 0, second.stdout)
+        self.assertEqual(copied.read_bytes(), b"sentinel", "an existing copy was overwritten")
+
+    def test_skip_existing_does_not_move_onto_an_existing_destination(self):
+        first = run_aconv("music", "mp3", "--on-existing", "copy", cwd=self.tmp)
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        second = run_aconv("music", "mp3", "--on-existing", "move", "--skip-existing", cwd=self.tmp)
+
+        self.assertEqual(second.returncode, 0, second.stdout)
+        self.assertTrue((self.source / "song.mp3").exists(),
+                        "the original was moved onto a destination that already existed")
+
+    def test_no_input_requires_the_positional_arguments(self):
+        result = run_aconv("--no-input", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("source is required", result.stdout)
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+class SourceSelectionTest(TempDirTestCase):
+    def test_a_named_file_converts_whatever_its_extension(self):
+        """ffmpeg reads more containers than the directory scan lists."""
+        make_tone(self.tmp / "book.m4b", extra=["-c:a", "aac"])
+
+        result = run_aconv("book.m4b", "mp3", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.tmp / "book_mp3" / "book.mp3").is_file())
+
+    def test_destination_inside_the_source_is_not_rescanned(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+
+        first = run_aconv("music", "flac", "--dest", "music/out", cwd=self.tmp)
+        second = run_aconv("music", "flac", "--dest", "music/out", cwd=self.tmp)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        produced = sorted(str(p.relative_to(self.tmp)) for p in source.rglob("*") if p.is_file())
+        self.assertEqual(produced, ["music/a.wav", "music/out/a.flac"],
+                         "the destination was picked up as a source")
+
+    def test_durations_measure_the_progress_bar_weights(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "short.wav", duration=1)
+        make_tone(source / "long.wav", duration=3)
+
+        durations = aconv.measure_durations(
+            [source / "short.wav", source / "long.wav"], workers=2)
+
+        self.assertIsNotNone(durations, "ffprobe is present, so durations should be available")
+        self.assertAlmostEqual(durations[0], 1.0, places=1)
+        self.assertAlmostEqual(durations[1], 3.0, places=1)
+
+    def test_durations_are_all_or_nothing(self):
+        (self.tmp / "broken.wav").write_text("not audio\n")
+        self.assertIsNone(aconv.measure_durations([self.tmp / "broken.wav"], workers=1))
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
 @unittest.skipUnless(pty is not None, "pty is not available on this platform")
 class InteractiveExistingFilesTest(TempDirTestCase):
     """The copy and move paths for files already in the target format.
@@ -302,6 +420,29 @@ class InteractiveExistingFilesTest(TempDirTestCase):
         self.assertIn("Move cancelled", output)
         self.assertTrue((self.source / "song.mp3").exists(), "a cancelled move removed the original")
         self.assertEqual(sorted(p.name for p in (self.tmp / "music_mp3").iterdir()), ["song.mp3"])
+
+    def test_a_full_command_line_does_not_ask_about_the_extension_filter(self):
+        code, output = run_aconv_interactive("music", "mp3", cwd=self.tmp, feed="s\n")
+
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("specific source extension", output)
+
+    def test_a_bare_invocation_still_asks_for_everything(self):
+        code, output = run_aconv_interactive(cwd=self.tmp, feed="music\nmp3\n\ns\n")
+
+        self.assertEqual(code, 0, output)
+        self.assertIn("Enter the source directory", output)
+        self.assertIn("specific source extension", output)
+        # song.mp3 was skipped, so it reserves nothing and the conversion of
+        # song.wav is free to take the plain name.
+        self.assertEqual([p.name for p in (self.tmp / "music_mp3").iterdir()], ["song.mp3"])
+
+    def test_no_input_never_prompts_on_a_tty(self):
+        code, output = run_aconv_interactive("music", "mp3", "--no-input", cwd=self.tmp, feed="")
+
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("Would you like to", output)
+        self.assertIn("skipping files already in the target format", output)
 
     def test_closed_stdin_on_a_tty_does_not_traceback(self):
         # EOT at a prompt is what raised an unhandled EOFError before. One EOT
