@@ -147,6 +147,7 @@ def measure_durations(files, workers):
     return durations
 
 def convert_file(source_file, dest_file, extra_args=None):
+    """Convert one file. Returns None on success, ffmpeg's stderr on failure."""
     # Ensure destination directory exists
     dest_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -160,7 +161,7 @@ def convert_file(source_file, dest_file, extra_args=None):
     cmd.append(str(dest_file))
     try:
         subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        return True, str(source_file)
+        return None
     except subprocess.CalledProcessError as e:
         # A failed or interrupted ffmpeg still leaves an empty or truncated file
         # behind. Remove it, otherwise the next run sees a file that is already
@@ -170,8 +171,7 @@ def convert_file(source_file, dest_file, extra_args=None):
         except OSError:
             # Nothing was written, or it is not ours to delete.
             pass
-        err = e.stderr.decode('utf-8', errors='replace').strip()
-        return False, f"Failed to convert {source_file}: {err}"
+        return e.stderr.decode('utf-8', errors='replace').strip()
 
 def move_file(source_file, dest_file):
     """Move `source_file` onto `dest_file` without a moment where neither exists.
@@ -287,8 +287,26 @@ def plan_destinations(source_path, dest_dir, keep_files, convert_files, target_f
 
     return keep_plan, convert_plan
 
+def failure_reason(err):
+    """Reduce ffmpeg's captured stderr to a single summary line.
+
+    -v error usually leaves a line or two, worth keeping whole, but a corrupt
+    container can produce a complaint per packet; the summary has to stay one
+    line per file or a big batch scrolls just like the live errors it exists
+    to outlast.
+    """
+    lines = [line.strip() for line in err.splitlines() if line.strip()]
+    if not lines:
+        return "ffmpeg reported no error output"
+    joined = "; ".join(lines)
+    return joined if len(joined) <= 160 else lines[0]
+
 def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=None):
-    """Convert every (source, destination) pair and return the success count.
+    """Convert every (source, destination) pair.
+
+    Returns (success_count, failures), the failures as (source, stderr) pairs.
+    Each failure is also tqdm.write()n the moment it happens: on a long batch
+    the returned list is hours away, and trouble should be visible live.
 
     Ctrl-C drops whatever is still queued. Without that, an interrupted run keeps
     going: ThreadPoolExecutor.shutdown(wait=True) drains the queue rather than
@@ -304,24 +322,28 @@ def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=No
         bar_args = dict(total=len(convert_plan), unit='file')
 
     success_count = 0
+    failures = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         tasks = {executor.submit(convert_file, src, dst, extra_args): src
                  for src, dst in convert_plan}
         try:
             with tqdm(desc="Converting", **bar_args) as pbar:
                 for future in as_completed(tasks):
-                    success, result = future.result()
-                    if success:
+                    error = future.result()
+                    if error is None:
                         success_count += 1
                     else:
-                        tqdm.write(result)  # Print error without breaking progress bar
+                        source = tasks[future]
+                        # Print error without breaking progress bar
+                        tqdm.write(f"Failed to convert {source}: {error}")
+                        failures.append((source, error))
                     pbar.update(weights[tasks[future]] if weights else 1)
         except KeyboardInterrupt:
             dropped = sum(1 for future in tasks if future.cancel())
             print(f"\nInterrupted. Dropped {dropped} queued file(s), "
                   "waiting for the conversion(s) already running to stop.")
             raise
-    return success_count
+    return success_count, failures
 
 def resolve_options(argv=None):
     """Resolve the command line into a run plan, prompting where needed.
@@ -536,15 +558,19 @@ def execute(options):
         weights = None
         bar_args = dict(total=len(options.convert_plan), unit='file')
 
-    success_count = run_conversions(options.convert_plan, options.extra_args,
-                                    options.workers, weights, bar_args)
+    success_count, failures = run_conversions(options.convert_plan, options.extra_args,
+                                              options.workers, weights, bar_args)
 
-    failed_count = len(options.convert_plan) - success_count
     print(f"\nConversion complete! {success_count}/{len(options.convert_plan)} "
           "files successfully converted.")
-    if failed_count:
+    if failures:
+        # The live error messages have scrolled off with the batch, on a big
+        # library hours ago, so repeat the failures as one block at the end,
+        # sorted to read as a checklist rather than replaying completion order.
+        print(f"\n{len(failures)} file(s) failed to convert:")
+        for source_file, error in sorted(failures):
+            print(f"  {source_file}: {failure_reason(error)}")
         # Exit non-zero so scripts and CI notice a partially failed batch.
-        print(f"{failed_count} file(s) failed to convert.")
         sys.exit(1)
 
 def main():

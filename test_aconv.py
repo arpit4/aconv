@@ -178,6 +178,23 @@ class PlanDestinationsTest(TempDirTestCase):
         self.assertEqual(convert_plan, [(track, self.tmp / "out" / "album" / "track.mp3")])
 
 
+class FailureReasonTest(unittest.TestCase):
+    def test_short_output_is_kept_whole(self):
+        self.assertEqual(
+            aconv.failure_reason("Header missing\nInvalid data found"),
+            "Header missing; Invalid data found")
+
+    def test_long_output_is_cut_to_the_first_meaningful_line(self):
+        err = "\n".join(["[mp3 @ 0x0] Header missing"] + ["decode error"] * 50)
+        self.assertEqual(aconv.failure_reason(err), "[mp3 @ 0x0] Header missing")
+
+    def test_leading_blank_lines_are_not_meaningful(self):
+        self.assertEqual(aconv.failure_reason("\n   \nreal error\n"), "real error")
+
+    def test_empty_output_still_yields_a_reason(self):
+        self.assertEqual(aconv.failure_reason(""), "ffmpeg reported no error output")
+
+
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
 class ResolveOptionsTest(TempDirTestCase):
     """The copy/move/skip decision and destination resolution, in-process.
@@ -428,6 +445,38 @@ class ConversionTest(TempDirTestCase):
         self.assertFalse((self.tmp / "music_mp3" / "broken.mp3").exists(),
                          "a broken conversion left an output file behind")
 
+    def test_failure_summary_lists_exactly_the_failed_files(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "good.wav")
+        (source / "bad_one.flac").write_text("this is not audio at all\n")
+        (source / "bad_two.wav").write_text("nor is this\n")
+
+        result = run_aconv("music", "mp3", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        lines = result.stdout.splitlines()
+        self.assertIn("2 file(s) failed to convert:", lines, result.stdout)
+        listed = lines[lines.index("2 file(s) failed to convert:") + 1:]
+        self.assertEqual(
+            [line.split(": ", 1)[0] for line in listed],
+            [f"  {(source / 'bad_one.flac').resolve()}",
+             f"  {(source / 'bad_two.wav').resolve()}"])
+        for line in listed:
+            self.assertNotEqual(line.split(": ", 1)[1].strip(), "",
+                                "a failure was listed without a reason")
+
+    def test_successful_run_prints_no_failure_summary(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+
+        result = run_aconv("music", "mp3", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Conversion complete!", result.stdout)
+        self.assertNotIn("failed to convert", result.stdout)
+
     def test_cover_art_source_converts_to_a_container_without_art(self):
         """ffmpeg picks theora for .ogg video streams, which fails; art must be dropped."""
         source = self.tmp / "music"
@@ -501,7 +550,7 @@ class InterruptTest(TempDirTestCase):
                 # which never reaches the code under test.
                 threading.Timer(0.15, os.kill, [os.getpid(), signal.SIGINT]).start()
             time.sleep(0.05)
-            return True, str(source_file)
+            return None
 
         original = aconv.convert_file
         aconv.convert_file = slow_convert
@@ -563,15 +612,16 @@ class InterruptTest(TempDirTestCase):
 
         def fake_convert(source_file, dest_file, extra_args=None):
             converted.append(source_file)
-            return True, str(source_file)
+            return None
 
         original = aconv.convert_file
         aconv.convert_file = fake_convert
         self.addCleanup(setattr, aconv, "convert_file", original)
 
-        success = aconv.run_conversions(plan, [], workers=2, weights=None)
+        success, failures = aconv.run_conversions(plan, [], workers=2, weights=None)
 
         self.assertEqual(success, 6)
+        self.assertEqual(failures, [])
         self.assertEqual(len(converted), 6)
 
     def test_failures_are_counted_but_do_not_stop_the_batch(self):
@@ -579,16 +629,17 @@ class InterruptTest(TempDirTestCase):
 
         def flaky_convert(source_file, dest_file, extra_args=None):
             if source_file.name == "in2.wav":
-                return False, f"Failed to convert {source_file}: synthetic"
-            return True, str(source_file)
+                return "synthetic"
+            return None
 
         original = aconv.convert_file
         aconv.convert_file = flaky_convert
         self.addCleanup(setattr, aconv, "convert_file", original)
 
-        success = aconv.run_conversions(plan, [], workers=2, weights=None)
+        success, failures = aconv.run_conversions(plan, [], workers=2, weights=None)
 
         self.assertEqual(success, 3)
+        self.assertEqual(failures, [(self.tmp / "in2.wav", "synthetic")])
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
