@@ -1,5 +1,7 @@
 # Offline Audio File Format Converter
 
+[![tests](https://github.com/arpit4/aconv/actions/workflows/tests.yml/badge.svg)](https://github.com/arpit4/aconv/actions/workflows/tests.yml)
+
 A fast, offline command-line tool for converting audio files between formats
 (e.g. `.m4a` to `.mp3`) using `ffmpeg`. It mirrors your folder structure, converts
 files in parallel, and never lets one output quietly overwrite another. Works
@@ -21,7 +23,8 @@ interactively or unattended from cron and CI.
 
 ## Requirements
 
-1. **Python 3.7 or newer** (no third-party packages beyond `tqdm`).
+1. **Python 3.7 or newer** (no third-party packages beyond `tqdm`). CI covers
+   3.9 through 3.13 on Linux and macOS.
 2. **ffmpeg**: Must be installed and accessible in your system's PATH.
    - macOS: `brew install ffmpeg`
    - Linux: `sudo apt install ffmpeg`
@@ -205,5 +208,11 @@ python3 -m unittest test_aconv -v
 Fixtures are generated with ffmpeg's `lavfi` source, so no binary test files are
 needed. Tests that shell out to ffmpeg are skipped when it is not installed.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md), including the known issues for the current
+release.
+
 ## License
-MIT License
+
+MIT, see [LICENSE](LICENSE).
