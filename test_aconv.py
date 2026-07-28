@@ -9,9 +9,11 @@ needs no binary test files. Run with:
 import os
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -254,6 +256,99 @@ class ConversionTest(TempDirTestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skipping files already in the target format", result.stdout)
+
+
+class InterruptTest(TempDirTestCase):
+    """Ctrl-C has to stop the batch, not just stop reporting on it.
+
+    ThreadPoolExecutor.shutdown(wait=True) drains the queue instead of dropping
+    it, so an interrupted run used to keep starting a fresh ffmpeg for every
+    remaining file with the progress bar already gone.
+    """
+
+    def _plan(self, count):
+        return [(self.tmp / f"in{i}.wav", self.tmp / f"out{i}.mp3") for i in range(count)]
+
+    def test_interrupt_drops_the_queued_conversions(self):
+        # 40 files at 0.05s each is ~2s of work, interrupted after ~0.15s. With
+        # the queue dropped only a handful ever start; without, all 40 do.
+        plan = self._plan(40)
+        started = []
+
+        def slow_convert(source_file, dest_file, extra_args=None):
+            started.append(source_file)
+            if len(started) == 1:
+                # Ctrl-C arriving mid-batch, which is the case that matters.
+                # It has to be delayed rather than sent from here: signalling
+                # inline interrupts the main thread while it is still submitting,
+                # which never reaches the code under test.
+                threading.Timer(0.15, os.kill, [os.getpid(), signal.SIGINT]).start()
+            time.sleep(0.05)
+            return True, str(source_file)
+
+        original = aconv.convert_file
+        aconv.convert_file = slow_convert
+        self.addCleanup(setattr, aconv, "convert_file", original)
+
+        with self.assertRaises(KeyboardInterrupt):
+            aconv.run_conversions(plan, [], workers=1, weights=None)
+
+        # The interrupt unwinds the main thread while the pool is still settling,
+        # so counting immediately would pass either way. Wait for the worker
+        # threads to go quiet first: that is where the queue used to drain.
+        self.assertTrue(self._wait_until_quiet(started), "the pool never settled")
+        self.assertLess(len(started), 15,
+                        f"the batch kept converting after the interrupt: "
+                        f"{len(started)} of {len(plan)} files were started")
+
+    @staticmethod
+    def _wait_until_quiet(started, settle=0.15, rounds=3, timeout=10):
+        """Wait until `started` has stopped growing for `rounds` consecutive checks."""
+        deadline = time.monotonic() + timeout
+        quiet = 0
+        while time.monotonic() < deadline:
+            before = len(started)
+            time.sleep(settle)
+            if len(started) == before:
+                quiet += 1
+                if quiet == rounds:
+                    return True
+            else:
+                quiet = 0
+        return False
+
+    def test_uninterrupted_runs_convert_everything(self):
+        plan = self._plan(6)
+        converted = []
+
+        def fake_convert(source_file, dest_file, extra_args=None):
+            converted.append(source_file)
+            return True, str(source_file)
+
+        original = aconv.convert_file
+        aconv.convert_file = fake_convert
+        self.addCleanup(setattr, aconv, "convert_file", original)
+
+        success = aconv.run_conversions(plan, [], workers=2, weights=None)
+
+        self.assertEqual(success, 6)
+        self.assertEqual(len(converted), 6)
+
+    def test_failures_are_counted_but_do_not_stop_the_batch(self):
+        plan = self._plan(4)
+
+        def flaky_convert(source_file, dest_file, extra_args=None):
+            if source_file.name == "in2.wav":
+                return False, f"Failed to convert {source_file}: synthetic"
+            return True, str(source_file)
+
+        original = aconv.convert_file
+        aconv.convert_file = flaky_convert
+        self.addCleanup(setattr, aconv, "convert_file", original)
+
+        success = aconv.run_conversions(plan, [], workers=2, weights=None)
+
+        self.assertEqual(success, 3)
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")

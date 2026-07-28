@@ -239,6 +239,42 @@ def plan_destinations(source_path, dest_dir, keep_files, convert_files, target_f
 
     return keep_plan, convert_plan
 
+def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=None):
+    """Convert every (source, destination) pair and return the success count.
+
+    Ctrl-C drops whatever is still queued. Without that, an interrupted run keeps
+    going: ThreadPoolExecutor.shutdown(wait=True) drains the queue rather than
+    discarding it, so worker threads carry on pulling files and each one starts a
+    fresh ffmpeg, after the terminal's signal has already been and gone. The
+    progress bar is down by then, so the batch continues out of sight.
+
+    Conversions already running are left to finish, which is bounded by the
+    worker count. Their ffmpeg processes have had the same Ctrl-C and normally
+    exit on their own, and convert_file() clears up any partial output.
+    """
+    if bar_args is None:
+        bar_args = dict(total=len(convert_plan), unit='file')
+
+    success_count = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        tasks = {executor.submit(convert_file, src, dst, extra_args): src
+                 for src, dst in convert_plan}
+        try:
+            with tqdm(desc="Converting", **bar_args) as pbar:
+                for future in as_completed(tasks):
+                    success, result = future.result()
+                    if success:
+                        success_count += 1
+                    else:
+                        tqdm.write(result)  # Print error without breaking progress bar
+                    pbar.update(weights[tasks[future]] if weights else 1)
+        except KeyboardInterrupt:
+            dropped = sum(1 for future in tasks if future.cancel())
+            print(f"\nInterrupted. Dropped {dropped} queued file(s), "
+                  "waiting for the conversion(s) already running to stop.")
+            raise
+    return success_count
+
 def main():
     parser = argparse.ArgumentParser(description="Offline Audio Format Converter")
     parser.add_argument("source", nargs='?', help="Source directory or file")
@@ -434,19 +470,7 @@ def main():
         weights = None
         bar_args = dict(total=len(convert_plan), unit='file')
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        tasks = {executor.submit(convert_file, src, dst, extra_args): src
-                 for src, dst in convert_plan}
-
-        success_count = 0
-        with tqdm(desc="Converting", **bar_args) as pbar:
-            for future in as_completed(tasks):
-                success, result = future.result()
-                if success:
-                    success_count += 1
-                else:
-                    tqdm.write(result)  # Print error without breaking progress bar
-                pbar.update(weights[tasks[future]] if weights else 1)
+    success_count = run_conversions(convert_plan, extra_args, args.workers, weights, bar_args)
 
     failed_count = len(convert_plan) - success_count
     print(f"\nConversion complete! {success_count}/{len(convert_plan)} files successfully converted.")
