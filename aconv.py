@@ -12,6 +12,8 @@ except ImportError:
     print("tqdm not installed. Please run: pip install -r requirements.txt")
     sys.exit(1)
 
+__version__ = "0.1.0"
+
 # Extensions picked up when scanning a directory. Audio-only containers, so that
 # scanning a folder of home videos does not quietly rip their soundtracks; a file
 # named directly on the command line is converted whatever its extension.
@@ -284,6 +286,7 @@ def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=No
 
 def main():
     parser = argparse.ArgumentParser(description="Offline Audio Format Converter")
+    parser.add_argument("--version", action="version", version=f"aconv {__version__}")
     parser.add_argument("source", nargs='?', help="Source directory or file")
     parser.add_argument("format", nargs='?', help="Target audio format (e.g., mp3, wav, flac)")
     parser.add_argument("--dest", help="Destination directory (optional)", default=None)

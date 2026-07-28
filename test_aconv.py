@@ -585,6 +585,11 @@ class InteractiveExistingFilesTest(TempDirTestCase):
 
 
 class CliValidationTest(TempDirTestCase):
+    def test_version_is_reported_without_needing_a_source(self):
+        result = run_aconv("--version", cwd=self.tmp)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"aconv {aconv.__version__}")
+
     def test_bitrate_and_quality_are_mutually_exclusive(self):
         source = self.tmp / "music"
         source.mkdir()
