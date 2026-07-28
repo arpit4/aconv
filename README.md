@@ -8,8 +8,10 @@ A fast, interactive, and offline command-line tool for converting audio files be
 - **Fast & Parallel**: Converts files concurrently (defaults to half your CPU cores to avoid oversubscribing ffmpeg, which is itself multi-threaded).
 - **Quality Control**: Set bitrate, VBR quality, and sample rate via flags.
 - **Smart Directory Handling**: Replicates the original folder structure in the destination.
-- **Collision-Safe**: Files that would map to the same output name (e.g. `song.wav` and `song.flac` both mapping to `song.mp3`) are disambiguated instead of silently overwritten.
-- **Existing File Detection**: Automatically detects files that are already in the target format and offers to copy, move, or skip them without re-encoding (moves require explicit confirmation).
+- **Collision-Safe**: Files that would map to the same output name (e.g. `song.wav` and `song.flac` both mapping to `song.mp3`) are disambiguated instead of silently overwritten. Comparison is case-insensitive, so `SONG.wav` and `song.flac` are also kept apart on macOS and Windows.
+- **Existing File Detection**: Automatically detects files that are already in the target format and offers to copy, move, or skip them without re-encoding (moves require explicit confirmation). Copied and moved files reserve their destination first, so a conversion can never overwrite one.
+- **Tags and Cover Art**: Metadata is carried over, and embedded cover art is kept whenever the target container supports it.
+- **Honest Exit Status**: Exits non-zero if any file failed, and never leaves a truncated output file behind.
 - **Format Filtering**: Optionally filter conversions to a specific source extension.
 - **Clean Progress Bar**: Shows conversion progress via `tqdm`.
 
@@ -82,9 +84,14 @@ python3 aconv.py /path/to/my_music mp3 --quality 2 --sample-rate 44100
 | `--dest` | Destination directory | `<source>_<format>` next to the source |
 | `--ext` | Only convert this source extension (e.g. `m4a`) | all audio files |
 | `--workers` | Number of parallel conversions | half the CPU cores |
-| `--bitrate` | Target audio bitrate / CBR (e.g. `320k`) | ffmpeg default |
-| `--quality` | VBR quality (ffmpeg `-q:a`, e.g. `2` for mp3) | ffmpeg default |
+| `--bitrate` | Target audio bitrate / CBR (e.g. `320k`). Cannot be combined with `--quality` | ffmpeg default |
+| `--quality` | VBR quality (ffmpeg `-q:a`, e.g. `2` for mp3). Cannot be combined with `--bitrate` | ffmpeg default |
 | `--sample-rate` | Target sample rate in Hz (e.g. `44100`) | source rate |
+
+### Exit Status
+
+`0` when every file converted, `1` on a usage error or if any file failed to convert,
+`2` on invalid arguments, `130` if interrupted with Ctrl-C.
 
 ## How It Works
 
@@ -103,6 +110,19 @@ python3 aconv.py /path/to/my_music mp3 --quality 2 --sample-rate 44100
 - **Non-interactive use.** When run without a terminal (scripts, CI, piped input),
   the tool does not prompt: it converts all audio files and skips any already in the
   target format. Provide `source` and `format` as arguments in that case.
+- **Cover art.** Art is copied as-is into `.mp3`, `.flac`, `.m4a`, `.m4b` and `.mp4`
+  outputs. For any other target it is dropped, because ffmpeg would otherwise try to
+  re-encode the picture with the container's default video codec and fail (converting
+  a file with embedded art to `.ogg` fails outright without this).
+
+## Tests
+
+```bash
+python3 -m unittest test_aconv -v
+```
+
+Fixtures are generated with ffmpeg's `lavfi` source, so no binary test files are
+needed. Tests that shell out to ffmpeg are skipped when it is not installed.
 
 ## License
 MIT License
