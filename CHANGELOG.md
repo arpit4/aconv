@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.2.0 (unreleased)
+
+Fixes both known issues from v0.1.0.
+
+- **Remuxing instead of re-encoding.** When a source file's audio is already a
+  codec the target container stores natively (FLAC inside `.mka` converted to
+  `.flac`, raw AAC converted to `.m4a`), the stream is now copied bit-for-bit
+  instead of decoded and re-encoded. Lossy audio no longer loses a generation
+  of quality on such conversions, and they finish in milliseconds. The codec
+  map is deliberately conservative (only pairings every mainstream player
+  accepts), any of `--bitrate`, `--quality` or `--sample-rate` forces a real
+  encode, and a failed codec probe falls back to encoding rather than failing
+  the file. The dry run reports which files would be remuxed.
+- **`--on-existing move` is now atomic across filesystems** (a v0.1.0 known
+  issue). Same-filesystem moves use an atomic rename; across filesystems the
+  copy is staged under a temporary name in the destination directory, synced
+  to disk, renamed into place, and only then is the original removed. An
+  interrupt at any point leaves either the intact source or a complete
+  destination, never neither.
+- **Failures are summarized after the bar** (a v0.1.0 known issue). Per-file
+  errors still print the moment they happen, but a partially failed run now
+  ends with a grouped block listing every failed file with a one-line reason,
+  instead of letting a dozen failures on a 500-file library scroll away with
+  only a count surviving.
+- **main() split into resolve_options() and execute()**, so the decision logic
+  (the copy/move/skip choice, destination resolution, `--skip-existing`
+  filtering) is testable in-process without a pty. Pure refactor; the CLI
+  behaves identically.
+- 72 tests, up from 41.
+
 ## v0.1.0
 
 First tagged release. The tool converts audio between formats with ffmpeg,

@@ -16,7 +16,8 @@ interactively or unattended from cron and CI.
 - **Collision-Safe**: Files that would map to the same output name (e.g. `song.wav` and `song.flac` both mapping to `song.mp3`) are disambiguated instead of silently overwritten. Comparison is case-insensitive, so `SONG.wav` and `song.flac` are also kept apart on macOS and Windows.
 - **Existing File Detection**: Automatically detects files that are already in the target format and offers to copy, move, or skip them without re-encoding. Copied and moved files reserve their destination first, so a conversion can never overwrite one.
 - **Tags and Cover Art**: Metadata is carried over, and embedded cover art is kept whenever the target container supports it.
-- **Honest Exit Status**: Exits non-zero if any file failed, and never leaves a truncated output file behind.
+- **Lossless Remuxing**: A file whose audio is already a codec the target container stores natively (e.g. FLAC inside `.mka` going to `.flac`) has its stream copied bit-for-bit instead of re-encoded: no generation loss, and near-instant. Any quality flag forces a real encode.
+- **Honest Exit Status**: Exits non-zero if any file failed, lists every failure with a one-line reason at the end of the run, and never leaves a truncated output file behind.
 - **Format Filtering**: Optionally filter conversions to a specific source extension.
 - **Scriptable**: `--dry-run`, `--skip-existing`, `--on-existing` and `--no-input` mean cron and CI never hit a prompt.
 - **Clean Progress Bar**: Shows conversion progress via `tqdm`, weighted by audio length so a long podcast does not stall the bar.
@@ -125,6 +126,9 @@ python3 aconv.py /path/to/my_music mp3 --on-existing copy
 An interactive `move` asks for a typed confirmation first. `--on-existing move`
 does not, because passing the flag is itself the confirmation.
 
+A move is atomic, including across filesystems: an interrupt mid-move leaves
+either the intact original or a complete destination file, never neither.
+
 ### Unattended Runs
 
 Nothing prompts when there is no terminal, so cron and CI runs never stall: the
@@ -174,11 +178,15 @@ resumes from the last file that actually completed.
 3. Maps every remaining file to a destination path, mirroring the source tree.
    Two files that would land on the same name are disambiguated, and the copied
    or moved files claim their paths first so a conversion cannot overwrite one.
-4. Measures the audio length of each file with `ffprobe`, to weight the progress
+4. Probes each file's audio codec with `ffprobe`. A file whose audio the target
+   container stores natively is remuxed (the stream copied bit-for-bit) instead
+   of re-encoded, unless a quality flag asks for a transformation. A failed probe
+   just means a normal encode.
+5. Measures the audio length of each file with `ffprobe`, to weight the progress
    bar. If any file cannot be measured, the bar counts files instead.
-5. Runs one `ffmpeg` process per file, several at a time. A conversion that fails
-   has its half-written output removed, and the run finishes with a non-zero exit
-   status.
+6. Runs one `ffmpeg` process per file, several at a time. A conversion that fails
+   has its half-written output removed and listed in the summary at the end, and
+   the run finishes with a non-zero exit status.
 
 ## Notes
 
