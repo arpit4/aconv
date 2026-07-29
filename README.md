@@ -21,6 +21,8 @@ interactively or unattended from cron and CI.
 - **Format Filtering**: Optionally filter conversions to a specific source extension.
 - **Scriptable**: `--dry-run`, `--skip-existing`, `--on-existing` and `--no-input` mean cron and CI never hit a prompt.
 - **Clean Progress Bar**: Shows conversion progress via `tqdm`, weighted by audio length so a long podcast does not stall the bar.
+- **Machine-Readable Progress**: `--progress jsonl` streams one JSON object per line on stdout for GUIs and other wrappers, with a stdin cancel channel via `--stdin-control`.
+- **Optional GUI**: A Tk front end, `python3 aconv_gui.py`, standard library only, that drives the CLI over that protocol. The CLI stays the primary tool.
 
 ## Requirements
 
@@ -144,6 +146,48 @@ source and format. To rule prompts out entirely, even on a terminal:
 python3 aconv.py /path/to/my_music mp3 --no-input
 ```
 
+### Machine-readable progress (--progress jsonl)
+
+`--progress jsonl` is for wrappers: the GUI below, or any script that wants
+to know what a run is doing without scraping the progress bar. It writes one
+JSON object per line to stdout and moves all human-readable output to stderr,
+so stdout stays parseable. It never prompts (it behaves like a run without a
+terminal), and it needs nothing beyond the standard library, not even
+`tqdm`, which only the bar uses.
+
+The first line is always `hello`, and its `protocol` field, currently `1`,
+only changes when the shape of the stream changes incompatibly, so a consumer
+that checks it will never misparse a newer aconv:
+
+```console
+$ python3 aconv.py /home/me/music mp3 --progress jsonl
+{"event": "hello", "protocol": 1, "version": "0.1.0"}
+{"event": "scan", "found": 2, "to_convert": 2, "already_in_format": 0}
+{"event": "plan", "keep": 0, "convert": 2, "remux": 0, "dest": "/home/me/music_mp3", "on_existing": "skip"}
+{"event": "probe", "done": 1, "total": 2}
+{"event": "probe", "done": 2, "total": 2}
+{"event": "file_start", "source": "/home/me/music/track02.wav", "dest": "/home/me/music_mp3/track02.mp3", "action": "convert"}
+{"event": "file_start", "source": "/home/me/music/track01.wav", "dest": "/home/me/music_mp3/track01.mp3", "action": "convert"}
+{"event": "file_done", "source": "/home/me/music/track01.wav", "dest": "/home/me/music_mp3/track01.mp3", "seconds": 1.0}
+{"event": "file_done", "source": "/home/me/music/track02.wav", "dest": "/home/me/music_mp3/track02.mp3", "seconds": 1.0}
+{"event": "done", "converted": 2, "failed": 0}
+```
+
+Conversions run in parallel, so the per-file events interleave. A failed file
+emits `file_failed` with the captured ffmpeg stderr, an interrupt emits
+`interrupted` with the number of files dropped, dry runs list each planned
+file as a `plan_item`, and every fatal exit is preceded by an `error` event.
+In `plan`, `convert` and `remux` are disjoint counts: their sum is the whole
+batch.
+
+`--stdin-control` (valid only with `--progress jsonl`) adds a cancel channel:
+the process watches stdin, and the line `cancel`, or EOF, which is what a
+crashed controller looks like, stops the run exactly like Ctrl-C does,
+exiting `130`.
+
+The stream is for detail; the process exit code stays the ground truth of the
+outcome, with the same meanings as ever (see [Exit Status](#exit-status)).
+
 ### Options
 
 | Flag | Description | Default |
@@ -158,6 +202,8 @@ python3 aconv.py /path/to/my_music mp3 --no-input
 | `--skip-existing` | Leave outputs that already exist alone instead of re-encoding them | re-encode everything |
 | `--dry-run` | Print the plan and exit without writing anything | off |
 | `--no-input` | Never prompt; use the defaults and fail if a required value is missing | off |
+| `--progress` | How to report progress: `bar`, `jsonl` (one JSON object per line on stdout, for machine consumers) or `none` | `bar` |
+| `--stdin-control` | Read control lines from stdin; `cancel` or EOF stops the run like Ctrl-C. Requires `--progress jsonl` | off |
 
 ### Exit Status
 
@@ -168,6 +214,35 @@ Ctrl-C drops everything still queued and waits only for the conversions already
 running, so it stops in about the time one file takes rather than finishing the
 batch. Any half-written output is removed, so a later `--skip-existing` run
 resumes from the last file that actually completed.
+
+## Graphical interface (optional)
+
+The CLI is the primary tool; `aconv_gui.py` is an optional Tk front end that
+drives it over the `--progress jsonl` protocol above. It is standard library
+only, with zero extra Python packages, not even `tqdm`, so it launches
+straight from a source checkout:
+
+```bash
+git clone https://github.com/arpit4/aconv.git
+python3 aconv/aconv_gui.py
+```
+
+It offers the same conversions with the same defaults: pick a source and a
+format, preview the plan with a dry run, watch per-file progress weighted by
+audio length, read the raw ffmpeg output behind any failure, and cancel
+mid-run, after which the Convert button offers a resume that leaves finished
+outputs alone. Moving files already in the target format asks for the same
+typed confirmation as the CLI.
+
+ffmpeg is still required. When it is not found, the GUI shows the install
+command for your platform ready to copy, and it also checks the usual
+Homebrew and `/usr/local` locations, because apps launched from Finder or a
+desktop environment often get a minimal PATH.
+
+Tk ships with the python.org, macOS and Windows Python installers, but some
+Linux distributions package it separately. If the GUI reports that tkinter is
+missing, install your distribution's Tk package. On Debian and Ubuntu that is
+`sudo apt install python3-tk`.
 
 ## How It Works
 
@@ -210,11 +285,13 @@ resumes from the last file that actually completed.
 ## Tests
 
 ```bash
-python3 -m unittest test_aconv -v
+python3 -m unittest test_aconv -v      # the CLI
+python3 -m unittest test_aconv_gui -v  # the GUI plumbing, no display needed
 ```
 
 Fixtures are generated with ffmpeg's `lavfi` source, so no binary test files are
-needed. Tests that shell out to ffmpeg are skipped when it is not installed.
+needed. Tests that shell out to ffmpeg are skipped when it is not installed, and
+the GUI suite's one Tk smoke test skips itself when no display is available.
 
 ## Changelog
 

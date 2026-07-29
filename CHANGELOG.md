@@ -24,11 +24,30 @@ Fixes both known issues from v0.1.0.
   ends with a grouped block listing every failed file with a one-line reason,
   instead of letting a dozen failures on a 500-file library scroll away with
   only a count surviving.
+- **Machine-readable progress for wrappers.** `--progress jsonl` writes one
+  JSON object per line to stdout and moves every human-readable print to
+  stderr, so stdout stays parseable. The first event is always `hello` with
+  `protocol: 1`, a number that only changes when the stream's shape changes
+  incompatibly; per-file events report each start, finish and failure (with
+  the captured ffmpeg stderr), and `done` closes every completed run. jsonl
+  never prompts, since a prompt would deadlock the consumer, and never imports
+  `tqdm`, so it runs from a bare checkout. `--stdin-control` adds a cancel
+  channel: the line `cancel`, or EOF from a dead controller, stops the run
+  exactly like Ctrl-C, exiting 130. The default bar mode's output is
+  byte-identical to before, and exit codes stay the ground truth throughout.
+- **An optional Tk GUI.** `aconv_gui.py` runs straight from a source checkout
+  (`python3 aconv_gui.py`, standard library only) and is a pure consumer of
+  the jsonl protocol; the CLI stays the primary tool. It shows a copyable
+  install command when ffmpeg is missing (and checks the Homebrew and
+  `/usr/local` bins, since Finder-launched apps get a minimal PATH), previews
+  dry runs, reports failures live with the raw ffmpeg output, weights the bar
+  by audio length, mirrors the CLI's typed move confirmation, and offers a
+  `--skip-existing` resume after a cancelled or failed run.
 - **main() split into resolve_options() and execute()**, so the decision logic
   (the copy/move/skip choice, destination resolution, `--skip-existing`
   filtering) is testable in-process without a pty. Pure refactor; the CLI
   behaves identically.
-- 72 tests, up from 41.
+- 111 tests across the CLI and GUI suites, up from 41.
 
 ## v0.1.0
 
