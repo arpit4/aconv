@@ -11,6 +11,12 @@ jobs:
     # macOS is included deliberately: the collision handling depends on how the
     # filesystem folds case, and the interrupt and pty tests depend on how the
     # platform delivers signals, so Linux alone would not exercise either.
+    #
+    # Windows is deliberately absent. The GUI and the cancel channel are
+    # expected to work there (Tk ships with the python.org installer, and
+    # terminate() is not a signal), but neither is verified, so the matrix
+    # does not claim it. The two tests that cannot run off POSIX skip
+    # themselves, so the suite still passes if you run it there by hand.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
