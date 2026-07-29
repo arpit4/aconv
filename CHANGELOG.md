@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.0 (unreleased)
+## v0.2.0
 
 Fixes both known issues from v0.1.0.
 
@@ -50,6 +50,18 @@ Fixes both known issues from v0.1.0.
   filtering) is testable in-process without a pty. Pure refactor; the CLI
   behaves identically.
 - 119 tests across the CLI and GUI suites, up from 41.
+
+### Known issues
+
+- Windows is not covered by CI, which runs Linux and macOS. The cancel channel
+  is the least tested part there: the SIGTERM cleanup and the restored SIGINT
+  handler are asserted only on POSIX, so on Windows they rest on the platform's
+  documented behaviour rather than on a passing test.
+- The Tk widget paths need a display, so they skip on headless runners. A green
+  CI run says the protocol and the GUI's logic layers are sound, not that the
+  window opens; that has been checked by hand on macOS.
+- The GUI converts one source per run, matching the CLI. Queueing several
+  folders means running it several times.
 
 ## v0.1.0
 

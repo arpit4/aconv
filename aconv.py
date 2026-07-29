@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Extensions picked up when scanning a directory. Audio-only containers, so that
 # scanning a folder of home videos does not quietly rip their soundtracks; a file

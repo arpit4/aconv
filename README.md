@@ -161,7 +161,7 @@ that checks it will never misparse a newer aconv:
 
 ```console
 $ python3 aconv.py /home/me/music mp3 --progress jsonl
-{"event": "hello", "protocol": 1, "version": "0.1.0"}
+{"event": "hello", "protocol": 1, "version": "0.2.0"}
 {"event": "scan", "found": 2, "to_convert": 2, "already_in_format": 0}
 {"event": "plan", "keep": 0, "convert": 2, "remux": 0, "dest": "/home/me/music_mp3", "on_existing": "skip"}
 {"event": "probe", "done": 1, "total": 2}
