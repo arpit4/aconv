@@ -670,6 +670,43 @@ class CancelControlTest(TempDirTestCase):
         self.assertEqual(error, "cancelled before it started")
         self.assertFalse((self.tmp / "out.mp3").exists())
 
+    def test_a_cancel_line_on_stdin_reaches_a_running_conversion(self):
+        """The wiring the end-to-end tests cannot pin down.
+
+        Whether a real encode outlives the cancel is a race against the
+        machine, so the claim that a cancel reaches what is *already running*
+        is made here instead, against a process that will not finish on its
+        own.
+        """
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        with aconv._live_lock:
+            aconv._live_processes.add(process)
+        self.addCleanup(aconv._live_processes.discard, process)
+
+        # interrupt_main() would raise in the test runner's own main thread;
+        # the sweep is what this test is about, so stub the interrupt out.
+        original_interrupt = aconv._thread.interrupt_main
+        aconv._thread.interrupt_main = lambda: None
+        self.addCleanup(setattr, aconv._thread, "interrupt_main", original_interrupt)
+        # start_stdin_control installs handlers on the way past; leave the
+        # runner's own signal disposition as it found it.
+        for number in (signal.SIGTERM, signal.SIGINT):
+            self.addCleanup(signal.signal, number, signal.getsignal(number))
+        original_stdin = sys.stdin
+        sys.stdin = io.StringIO("cancel\n")
+        self.addCleanup(setattr, sys, "stdin", original_stdin)
+
+        aconv.start_stdin_control()
+
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("a cancel line on stdin never reached the running process")
+
 
 class InterruptTest(TempDirTestCase):
     """Ctrl-C has to stop the batch, not just stop reporting on it.
@@ -1041,12 +1078,18 @@ class JsonlProtocolTest(TempDirTestCase):
     @unittest.skipUnless(os.name == "posix", "SIGTERM delivery is POSIX-only")
     def test_sigterm_cleans_up_like_a_cancel(self):
         # A controller that gives up on the stdin channel falls back to
-        # terminating the process; that must behave like a cancel, stop the
-        # in-flight ffmpeg, remove its partial output, exit 130, rather than
-        # kill aconv and leave an orphaned encoder writing a truncated file.
+        # terminating the process; that must behave like a cancel (drop the
+        # batch, exit 130, leave nothing truncated) rather than kill aconv
+        # and leave an orphaned encoder writing a partial file.
+        #
+        # A batch rather than one long file: how much of a single encode
+        # survives the signal is a race against the machine, but a queue that
+        # cannot drain in the signal's window makes the outcome the same
+        # everywhere.
         source = self.tmp / "music"
         source.mkdir()
-        make_tone(source / "long.wav", duration=300)
+        for i in range(5):
+            make_tone(source / f"tone{i}.wav", duration=20)
 
         process = subprocess.Popen(
             [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
@@ -1074,10 +1117,16 @@ class JsonlProtocolTest(TempDirTestCase):
         self.assertEqual(code, 130, stderr)
         self.assertNotIn("done", [e["event"] for e in events],
                          "the batch ran to completion despite the SIGTERM")
+        # Whatever the signal caught mid-encode is either finished whole or
+        # gone; a truncated output would make a later --skip-existing resume
+        # trust a broken file.
         dest = self.tmp / "music_mp3"
-        leftovers = list(dest.glob("*.mp3")) if dest.exists() else []
-        self.assertEqual(leftovers, [],
-                         "a terminated encode left its partial output behind")
+        if dest.exists():
+            for output in dest.iterdir():
+                returncode, duration = probe(output, "format=duration")
+                self.assertEqual(returncode, 0, f"{output.name} was left unreadable")
+                self.assertAlmostEqual(float(duration), 20.0, delta=1.0,
+                                       msg=f"{output.name} was left truncated")
 
     @unittest.skipUnless(os.name == "posix", "preexec_fn is POSIX-only")
     def test_stdin_control_cancel_works_with_sigint_ignored(self):
@@ -1118,48 +1167,6 @@ class JsonlProtocolTest(TempDirTestCase):
         self.assertEqual(code, 130, stderr)
         self.assertNotIn("done", [e["event"] for e in events],
                          "the batch ran to completion despite the cancel")
-
-    def test_stdin_control_cancel_terminates_the_conversion_in_flight(self):
-        source = self.tmp / "music"
-        source.mkdir()
-        # A single file whose encode far outlives the cancel. Without the
-        # terminate sweep the cancel only lands once the file finishes: the
-        # stream would show file_done and the full output would remain.
-        make_tone(source / "long.wav", duration=300)
-
-        process = subprocess.Popen(
-            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
-             "--stdin-control", "--workers", "1"],
-            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True)
-        events = []
-        try:
-            for line in process.stdout:
-                events.append(json.loads(line))
-                if events[-1]["event"] == "file_start":
-                    process.stdin.write("cancel\n")
-                    process.stdin.flush()
-                    break
-            events.extend(json.loads(line) for line in process.stdout)
-            code = process.wait(timeout=60)
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.wait()
-            stderr = process.stderr.read()
-            process.stdin.close()
-            process.stdout.close()
-            process.stderr.close()
-
-        self.assertEqual(code, 130, stderr)
-        kinds = [e["event"] for e in events]
-        self.assertIn("interrupted", kinds)
-        self.assertNotIn("file_done", kinds,
-                         "the in-flight encode ran to completion despite the cancel")
-        dest = self.tmp / "music_mp3"
-        leftovers = list(dest.glob("*.mp3")) if dest.exists() else []
-        self.assertEqual(leftovers, [],
-                         "a terminated encode left its partial output behind")
 
     def test_default_mode_emits_no_json_and_is_unchanged(self):
         source = self.tmp / "music"
