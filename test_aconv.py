@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import errno
 import io
+import json
 import os
 import select
 import shutil
@@ -338,7 +339,8 @@ class ExecuteTest(TempDirTestCase):
         base = dict(dest_dir=self.tmp / "out", target_format="mp3", extra_args=[],
                     remux_sources=set(), remux_args=[],
                     choice='s', keep_plan=[], convert_plan=[], dry_run=False,
-                    workers=1, bitrate=None, quality=None, sample_rate=None)
+                    workers=1, bitrate=None, quality=None, sample_rate=None,
+                    progress='bar', emit=None)
         base.update(overrides)
         return argparse.Namespace(**base)
 
@@ -826,6 +828,225 @@ class ScriptableFlagsTest(TempDirTestCase):
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+class JsonlProtocolTest(TempDirTestCase):
+    """The --progress jsonl contract: pure JSON on stdout, humans on stderr.
+
+    The event stream is what a GUI or any other machine consumer parses, so
+    these tests pin the field names and the ordering guarantees, not just
+    that something JSON-shaped comes out.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # run_aconv resolves the paths it prints, so resolve ours too or none
+        # of the source/dest assertions would compare equal on macOS.
+        self.tmp = self.tmp.resolve()
+
+    def events(self, result):
+        """Parse stdout as one JSON object per line; anything else fails."""
+        events = []
+        for line in result.stdout.splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                self.fail(f"stdout is not pure JSON: {line!r}")
+        return events
+
+    def test_full_event_stream_for_a_real_conversion(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav", frequency=440)
+        make_tone(source / "b.flac", frequency=550)
+        make_tone(source / "keep.mp3", frequency=660)
+
+        result = run_aconv("music", "mp3", "--progress", "jsonl",
+                           "--on-existing", "copy", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.events(result)
+        self.assertEqual(events[0],
+                         {"event": "hello", "protocol": 1, "version": aconv.__version__})
+        kinds = [e["event"] for e in events]
+        scan = events[kinds.index("scan")]
+        self.assertEqual((scan["found"], scan["to_convert"], scan["already_in_format"]),
+                         (3, 2, 1))
+        plan = events[kinds.index("plan")]
+        self.assertEqual((plan["keep"], plan["convert"], plan["remux"], plan["on_existing"]),
+                         (1, 2, 0, "copy"))
+        self.assertEqual(plan["dest"], str(self.tmp / "music_mp3"))
+        self.assertEqual(events[kinds.index("keep_done")]["count"], 1)
+        probes = [e for e in events if e["event"] == "probe"]
+        self.assertEqual(probes[-1], {"event": "probe", "done": 2, "total": 2})
+        done_for = [e["source"] for e in events if e["event"] == "file_done"]
+        self.assertEqual(sorted(done_for),
+                         sorted([str(source / "a.wav"), str(source / "b.flac")]))
+        for e in events:
+            if e["event"] == "file_done":
+                self.assertIsInstance(e["seconds"], float)
+        # Every file_start precedes its file_done.
+        for src in done_for:
+            start_at = next(i for i, e in enumerate(events)
+                            if e["event"] == "file_start" and e["source"] == src)
+            done_at = next(i for i, e in enumerate(events)
+                           if e["event"] == "file_done" and e["source"] == src)
+            self.assertLess(start_at, done_at)
+        self.assertEqual(events[-1], {"event": "done", "converted": 2, "failed": 0})
+        self.assertIn("Conversion complete!", result.stderr,
+                      "the human summary did not go to stderr")
+
+    def test_ffmpeg_failure_emits_file_failed(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "good.wav")
+        (source / "broken.flac").write_text("this is not audio at all\n")
+
+        result = run_aconv("music", "mp3", "--progress", "jsonl", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        events = self.events(result)
+        failed = [e for e in events if e["event"] == "file_failed"]
+        self.assertEqual([e["source"] for e in failed], [str(source / "broken.flac")])
+        self.assertNotEqual(failed[0]["error"].strip(), "",
+                            "file_failed carried no ffmpeg stderr")
+        self.assertEqual(events[-1], {"event": "done", "converted": 1, "failed": 1})
+
+    def test_plan_counts_convert_and_remux_disjointly(self):
+        # A consumer totals the batch as convert + remux, so a remuxed file
+        # must not be counted under both fields.
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "song.mka", extra=["-c:a", "flac"])
+        make_tone(source / "other.wav")
+
+        result = run_aconv("music", "flac", "--progress", "jsonl", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.events(result)
+        plan = next(e for e in events if e["event"] == "plan")
+        self.assertEqual((plan["convert"], plan["remux"]), (1, 1))
+        actions = sorted(e["action"] for e in events if e["event"] == "file_start")
+        self.assertEqual(actions, ["convert", "remux"])
+
+    def test_dry_run_emits_plan_items_and_writes_nothing(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "song.wav")
+        make_tone(source / "keep.mp3")
+
+        result = run_aconv("music", "mp3", "--progress", "jsonl", "--dry-run",
+                           "--on-existing", "copy", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        items = [e for e in self.events(result) if e["event"] == "plan_item"]
+        self.assertEqual(
+            sorted((e["action"], e["source"], e["dest"]) for e in items),
+            sorted([("copy", str(source / "keep.mp3"),
+                     str(self.tmp / "music_mp3" / "keep.mp3")),
+                    ("convert", str(source / "song.wav"),
+                     str(self.tmp / "music_mp3" / "song.mp3"))]))
+        self.assertFalse((self.tmp / "music_mp3").exists(), "dry run created the destination")
+
+    def test_missing_source_emits_an_error_event(self):
+        result = run_aconv("--progress", "jsonl", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 1)
+        events = self.events(result)
+        self.assertEqual(events[0]["event"], "hello")
+        self.assertEqual(events[-1]["event"], "error")
+        self.assertIn("source is required", events[-1]["message"])
+
+    def test_stdin_control_cancel_stops_the_run(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        # Long enough that the batch cannot finish before the cancel lands.
+        for i in range(5):
+            make_tone(source / f"tone{i}.wav", duration=20)
+
+        process = subprocess.Popen(
+            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
+             "--stdin-control", "--workers", "1"],
+            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        events = []
+        try:
+            for line in process.stdout:
+                events.append(json.loads(line))
+                if events[-1]["event"] == "file_start":
+                    process.stdin.write("cancel\n")
+                    process.stdin.flush()
+                    break
+            events.extend(json.loads(line) for line in process.stdout)
+            code = process.wait(timeout=120)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr = process.stderr.read()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(code, 130, stderr)
+        kinds = [e["event"] for e in events]
+        self.assertIn("interrupted", kinds)
+        self.assertIn("dropped", events[kinds.index("interrupted")])
+        self.assertNotIn("done", kinds, "the batch ran to completion despite the cancel")
+        # Whatever was mid-flight when the cancel landed must have finished
+        # whole or been removed, never left truncated.
+        dest = self.tmp / "music_mp3"
+        if dest.exists():
+            for output in dest.iterdir():
+                returncode, duration = probe(output, "format=duration")
+                self.assertEqual(returncode, 0, f"{output.name} was left unreadable")
+                self.assertAlmostEqual(float(duration), 20.0, delta=1.0,
+                                       msg=f"{output.name} was left truncated")
+
+    def test_default_mode_emits_no_json_and_is_unchanged(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+
+        result = run_aconv("music", "mp3", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("{", result.stdout)
+        self.assertIn("Found 1 audio files. Converting to .mp3...", result.stdout)
+        self.assertIn(f"Destination: {self.tmp / 'music_mp3'}", result.stdout)
+        self.assertIn("Conversion complete! 1/1 files successfully converted.",
+                      result.stdout)
+
+    def test_progress_none_keeps_the_human_output_without_a_bar(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+
+        result = run_aconv("music", "mp3", "--progress", "none", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Conversion complete! 1/1 files successfully converted.",
+                      result.stdout)
+        self.assertEqual(result.stderr, "", "something other than the bar wrote to stderr")
+        self.assertTrue((self.tmp / "music_mp3" / "a.mp3").is_file())
+
+    def test_jsonl_never_imports_tqdm(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+        script = (
+            "import sys\n"
+            "import aconv\n"
+            "options = aconv.resolve_options([sys.argv[1], 'mp3', '--progress', 'jsonl'])\n"
+            "aconv.execute(options)\n"
+            "assert 'tqdm' not in sys.modules, 'a jsonl run imported tqdm'\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(source)],
+            cwd=str(Path(ACONV).parent), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
 class SourceSelectionTest(TempDirTestCase):
     def test_a_named_file_converts_whatever_its_extension(self):
         """ffmpeg reads more containers than the directory scan lists."""
@@ -984,6 +1205,11 @@ class CliValidationTest(TempDirTestCase):
         result = run_aconv("nope", "mp3", cwd=self.tmp)
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not exist", result.stdout)
+
+    def test_stdin_control_requires_jsonl(self):
+        result = run_aconv("music", "mp3", "--stdin-control", cwd=self.tmp)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--stdin-control requires --progress jsonl", result.stderr)
 
 
 if __name__ == "__main__":
