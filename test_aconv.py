@@ -1379,5 +1379,41 @@ class CliValidationTest(TempDirTestCase):
         self.assertIn("--stdin-control requires --progress jsonl", result.stderr)
 
 
+class AsciiSourceTest(unittest.TestCase):
+    """Every tracked text file stays ASCII.
+
+    Typographic characters reach these files by being pasted rather than
+    typed: an em dash from an editor, a single-character ellipsis in a label,
+    a decorative arrow. They survive review because they look right, then
+    turn up in a terminal that cannot render them. Cheaper to forbid the
+    whole class than to argue about each one.
+    """
+
+    TEXT_SUFFIXES = {'.py', '.md', '.yml', '.yaml', '.txt', '.cfg', '.toml'}
+    TEXT_NAMES = {'.gitignore', 'LICENSE'}
+
+    def test_no_tracked_text_file_has_non_ascii(self):
+        repo = Path(__file__).resolve().parent
+        listing = subprocess.run(['git', 'ls-files'], cwd=str(repo),
+                                 stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True)
+        if listing.returncode != 0:
+            self.skipTest("not a git checkout")
+        offenders = {}
+        for name in listing.stdout.split():
+            path = repo / name
+            if path.suffix not in self.TEXT_SUFFIXES and path.name not in self.TEXT_NAMES:
+                continue
+            try:
+                text = path.read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                continue
+            found = sorted({char for char in text if ord(char) > 127})
+            if found:
+                offenders[name] = found
+        self.assertEqual(offenders, {},
+                         "non-ASCII characters in tracked text files")
+
+
 if __name__ == "__main__":
     unittest.main()
