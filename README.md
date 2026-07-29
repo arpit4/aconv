@@ -36,6 +36,10 @@ interactively or unattended from cron and CI.
      by audio length. Without it the bar simply counts files instead.
 3. **Python Packages**:
    - Install dependencies using `pip install -r requirements.txt` (currently requires `tqdm`).
+   - `tqdm` draws the progress bar and nothing else, so `--progress jsonl` and
+     `--progress none` run on a bare checkout without it. The GUI, which uses
+     the former, needs no packages at all, only Tk, which the standard library
+     ships (see [Graphical interface](#graphical-interface-optional)).
 
 ## Installation
 
@@ -182,8 +186,12 @@ batch.
 
 `--stdin-control` (valid only with `--progress jsonl`) adds a cancel channel:
 the process watches stdin, and the line `cancel`, or EOF, which is what a
-crashed controller looks like, stops the run exactly like Ctrl-C does,
-exiting `130`.
+crashed controller looks like, stops the run and exits `130`, just as Ctrl-C
+does on a terminal. It also terminates the conversions already running, since
+no signal reaches them through a pipe the way a terminal's Ctrl-C reaches the
+whole process group; their partial outputs are removed as usual. `SIGTERM`
+does the same, so a controller that gives up on the channel and kills the
+process still leaves no orphaned `ffmpeg` behind.
 
 The stream is for detail; the process exit code stays the ground truth of the
 outcome, with the same meanings as ever (see [Exit Status](#exit-status)).
@@ -203,12 +211,13 @@ outcome, with the same meanings as ever (see [Exit Status](#exit-status)).
 | `--dry-run` | Print the plan and exit without writing anything | off |
 | `--no-input` | Never prompt; use the defaults and fail if a required value is missing | off |
 | `--progress` | How to report progress: `bar`, `jsonl` (one JSON object per line on stdout, for machine consumers) or `none` | `bar` |
-| `--stdin-control` | Read control lines from stdin; `cancel` or EOF stops the run like Ctrl-C. Requires `--progress jsonl` | off |
+| `--stdin-control` | Read control lines from stdin; `cancel` or EOF stops the run like Ctrl-C, ending the conversions in flight. Requires `--progress jsonl` | off |
 
 ### Exit Status
 
 `0` when every file converted, `1` on a usage error or if any file failed to convert,
-`2` on invalid arguments, `130` if interrupted with Ctrl-C.
+`2` on invalid arguments, `130` if the run was cancelled, either with Ctrl-C or
+through the `--stdin-control` channel.
 
 Ctrl-C drops everything still queued and waits only for the conversions already
 running, so it stops in about the time one file takes rather than finishing the
