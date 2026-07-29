@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .DS_Store
 test_audio/
+
+# Local editor state, which records absolute paths from whoever ran it.
+.vscode/

@@ -6,6 +6,11 @@ needs no binary test files. Run with:
     python3 -m unittest test_aconv -v
 """
 
+import argparse
+import contextlib
+import errno
+import io
+import json
 import os
 import select
 import shutil
@@ -174,6 +179,283 @@ class PlanDestinationsTest(TempDirTestCase):
         self.assertEqual(convert_plan, [(track, self.tmp / "out" / "album" / "track.mp3")])
 
 
+class FailureReasonTest(unittest.TestCase):
+    def test_short_output_is_kept_whole(self):
+        self.assertEqual(
+            aconv.failure_reason("Header missing\nInvalid data found"),
+            "Header missing; Invalid data found")
+
+    def test_long_output_is_cut_to_the_first_meaningful_line(self):
+        err = "\n".join(["[mp3 @ 0x0] Header missing"] + ["decode error"] * 50)
+        self.assertEqual(aconv.failure_reason(err), "[mp3 @ 0x0] Header missing")
+
+    def test_leading_blank_lines_are_not_meaningful(self):
+        self.assertEqual(aconv.failure_reason("\n   \nreal error\n"), "real error")
+
+    def test_empty_output_still_yields_a_reason(self):
+        self.assertEqual(aconv.failure_reason(""), "ffmpeg reported no error output")
+
+
+class StreamCopyDecisionTest(unittest.TestCase):
+    """The remux-or-encode decision, with the codec probe stubbed out."""
+
+    def stub_probe(self, value):
+        original = aconv.probe_audio_codecs
+        aconv.probe_audio_codecs = lambda path: value
+        self.addCleanup(setattr, aconv, "probe_audio_codecs", original)
+
+    def test_matching_codec_is_remuxed(self):
+        self.stub_probe(("flac",))
+        self.assertTrue(aconv.should_stream_copy(Path("song.mka"), "flac"))
+
+    def test_mismatched_codec_is_encoded(self):
+        self.stub_probe(("vorbis",))
+        self.assertFalse(aconv.should_stream_copy(Path("song.mka"), "flac"))
+
+    def test_probe_failure_falls_back_to_encode(self):
+        self.stub_probe(None)
+        self.assertFalse(aconv.should_stream_copy(Path("song.mka"), "flac"))
+
+    def test_a_mixed_codec_source_is_encoded(self):
+        """ffmpeg picks the kept stream itself, so any mismatch means encode."""
+        self.stub_probe(("flac", "vorbis"))
+        self.assertFalse(aconv.should_stream_copy(Path("song.mka"), "flac"))
+
+    def test_an_unmapped_target_never_probes(self):
+        def explode(path):
+            raise AssertionError("probed a file for a target with no codec map")
+        original = aconv.probe_audio_codecs
+        aconv.probe_audio_codecs = explode
+        self.addCleanup(setattr, aconv, "probe_audio_codecs", original)
+
+        self.assertFalse(aconv.should_stream_copy(Path("song.flac"), "mka"))
+
+    def test_stream_copy_args_copy_the_audio_stream(self):
+        args = argparse.Namespace(bitrate=None, quality=None, sample_rate=None)
+
+        remux = aconv.build_ffmpeg_args(args, "flac", stream_copy=True)
+        encode = aconv.build_ffmpeg_args(args, "flac")
+
+        copy_at = remux.index("-c:a")
+        self.assertEqual(remux[copy_at:copy_at + 2], ["-c:a", "copy"])
+        self.assertNotIn("-c:a", encode)
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+class ResolveOptionsTest(TempDirTestCase):
+    """The copy/move/skip decision and destination resolution, in-process.
+
+    resolve_options() only inspects names and paths, nothing is converted,
+    so empty files are enough, but check_ffmpeg() still runs inside it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # macOS keeps temporary directories behind a /var -> /private/var
+        # symlink, and resolve_options() resolves the paths it is given, so
+        # resolve ours too or none of the path assertions would compare equal.
+        self.tmp = self.tmp.resolve()
+        self.source = self.tmp / "music"
+        self.source.mkdir()
+        (self.source / "song.wav").touch()
+        (self.source / "song.mp3").touch()
+
+    def resolve(self, *cli_args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            options = aconv.resolve_options(list(cli_args))
+        return options, out.getvalue()
+
+    def test_on_existing_copy_reserves_the_kept_destination(self):
+        options, _ = self.resolve(str(self.source), "mp3", "--on-existing", "copy")
+
+        dest = self.tmp / "music_mp3"
+        self.assertEqual(options.choice, 'c')
+        self.assertEqual(options.keep_plan, [(self.source / "song.mp3", dest / "song.mp3")])
+        self.assertEqual(options.convert_plan,
+                         [(self.source / "song.wav", dest / "song_wav.mp3")])
+
+    def test_on_existing_move_needs_no_confirmation(self):
+        options, _ = self.resolve(str(self.source), "mp3", "--on-existing", "move")
+
+        self.assertEqual(options.choice, 'm')
+        self.assertEqual(options.keep_plan,
+                         [(self.source / "song.mp3", self.tmp / "music_mp3" / "song.mp3")])
+
+    def test_on_existing_skip_reserves_nothing(self):
+        options, _ = self.resolve(str(self.source), "mp3", "--on-existing", "skip")
+
+        self.assertEqual(options.choice, 's')
+        self.assertEqual(options.keep_plan, [])
+        self.assertEqual(options.convert_plan,
+                         [(self.source / "song.wav", self.tmp / "music_mp3" / "song.mp3")])
+
+    def test_no_input_defaults_to_skip(self):
+        options, output = self.resolve(str(self.source), "mp3", "--no-input")
+
+        self.assertEqual(options.choice, 's')
+        self.assertIn("skipping files already in the target format", output)
+
+    def test_default_destination_sits_beside_the_source(self):
+        options, _ = self.resolve(str(self.source), "mp3", "--no-input")
+        self.assertEqual(options.dest_dir, self.tmp / "music_mp3")
+
+    def test_a_file_source_names_its_destination_after_the_file(self):
+        track = self.tmp / "loose.wav"
+        track.touch()
+
+        options, _ = self.resolve(str(track), "mp3", "--no-input")
+
+        self.assertEqual(options.dest_dir, self.tmp / "loose_mp3")
+        self.assertEqual(options.convert_plan, [(track, self.tmp / "loose_mp3" / "loose.mp3")])
+
+    def test_dest_flag_overrides_the_default(self):
+        options, _ = self.resolve(str(self.source), "mp3",
+                                  "--dest", str(self.tmp / "elsewhere"), "--no-input")
+        self.assertEqual(options.dest_dir, self.tmp / "elsewhere")
+
+    def test_skip_existing_filters_both_plans(self):
+        dest = self.tmp / "music_mp3"
+        dest.mkdir()
+        (dest / "song.mp3").touch()
+
+        options, output = self.resolve(str(self.source), "mp3",
+                                       "--on-existing", "copy", "--skip-existing")
+
+        self.assertEqual(options.keep_plan, [])
+        self.assertEqual(options.convert_plan,
+                         [(self.source / "song.wav", dest / "song_wav.mp3")])
+        self.assertIn("leaving 1 existing output file(s) alone", output)
+
+
+class ExecuteTest(TempDirTestCase):
+    """The copy/move pass and the dry-run report, in-process.
+
+    Plans are built by hand so no ffmpeg is needed: an empty convert plan
+    makes execute() stop right after the pass under test.
+    """
+
+    def options(self, **overrides):
+        base = dict(dest_dir=self.tmp / "out", target_format="mp3", extra_args=[],
+                    remux_sources=set(), remux_args=[],
+                    choice='s', keep_plan=[], convert_plan=[], dry_run=False,
+                    workers=1, bitrate=None, quality=None, sample_rate=None,
+                    progress='bar', emit=None)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def execute(self, options):
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as caught, contextlib.redirect_stdout(out):
+            aconv.execute(options)
+        return caught.exception.code, out.getvalue()
+
+    def test_copy_pass_keeps_the_original(self):
+        source = self.tmp / "song.mp3"
+        source.write_bytes(b"original")
+        options = self.options(choice='c',
+                               keep_plan=[(source, self.tmp / "out" / "song.mp3")])
+
+        code, output = self.execute(options)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Copying 1 files", output)
+        self.assertEqual((self.tmp / "out" / "song.mp3").read_bytes(), b"original")
+        self.assertTrue(source.exists(), "copy removed the original")
+
+    def test_move_pass_removes_the_original(self):
+        source = self.tmp / "song.mp3"
+        source.write_bytes(b"original")
+        options = self.options(choice='m',
+                               keep_plan=[(source, self.tmp / "out" / "song.mp3")])
+
+        code, output = self.execute(options)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Moving 1 files", output)
+        self.assertEqual((self.tmp / "out" / "song.mp3").read_bytes(), b"original")
+        self.assertFalse(source.exists(), "move left the original in place")
+
+    def test_dry_run_writes_nothing(self):
+        source = self.tmp / "song.mp3"
+        source.write_bytes(b"original")
+        options = self.options(choice='c', dry_run=True,
+                               keep_plan=[(source, self.tmp / "out" / "song.mp3")],
+                               convert_plan=[(self.tmp / "song.wav",
+                                              self.tmp / "out" / "song_wav.mp3")])
+
+        code, output = self.execute(options)
+
+        self.assertEqual(code, 0)
+        self.assertFalse((self.tmp / "out").exists(), "dry run created the destination")
+        self.assertIn("1 file(s) to copy, 1 to convert.", output)
+
+
+class AtomicMoveTest(TempDirTestCase):
+    """The cross-filesystem branch of the move pass.
+
+    shutil.move degrades to copy-then-delete when the destination sits on
+    another filesystem, so an interrupt mid-move used to lose the file: gone
+    from the source, half-written at the destination. os.replace cannot cross
+    filesystems in a test, so the EXDEV refusal is injected instead.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.source = self.tmp / "song.mp3"
+        self.source.write_bytes(b"original")
+        self.dest_dir = self.tmp / "out"
+        self.dest_dir.mkdir()
+        self.dest = self.dest_dir / "song.mp3"
+
+    def force_exdev(self):
+        """Make the first os.replace fail the way a cross-device rename does."""
+        real_replace = os.replace
+        calls = []
+
+        def cross_device_replace(src, dst):
+            if not calls:
+                calls.append(src)
+                raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+            return real_replace(src, dst)
+
+        os.replace = cross_device_replace
+        self.addCleanup(setattr, os, "replace", real_replace)
+        return calls
+
+    def test_cross_filesystem_move_completes(self):
+        calls = self.force_exdev()
+
+        aconv.move_file(self.source, self.dest)
+
+        self.assertEqual(len(calls), 1, "the EXDEV fallback was never exercised")
+        self.assertEqual(self.dest.read_bytes(), b"original")
+        self.assertFalse(self.source.exists(), "move left the original in place")
+        self.assertEqual([p.name for p in self.dest_dir.iterdir()], ["song.mp3"],
+                         "the staging file was left behind")
+
+    def test_interrupted_copy_keeps_the_source_and_no_half_destination(self):
+        self.force_exdev()
+
+        def interrupted_copy(fsrc, fdst, length=0):
+            # Write part of the data first, so that a leaked staging file
+            # would be a half-file rather than an empty one.
+            fdst.write(b"orig")
+            raise KeyboardInterrupt
+
+        real_copy = shutil.copyfileobj
+        shutil.copyfileobj = interrupted_copy
+        self.addCleanup(setattr, shutil, "copyfileobj", real_copy)
+
+        with self.assertRaises(KeyboardInterrupt):
+            aconv.move_file(self.source, self.dest)
+
+        self.assertEqual(self.source.read_bytes(), b"original", "the source was damaged")
+        self.assertFalse(self.dest.exists(), "a half-file appeared under the final name")
+        self.assertEqual(list(self.dest_dir.iterdir()), [],
+                         "the staging file was not cleaned up")
+
+
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
 class ConversionTest(TempDirTestCase):
     def test_converts_a_directory(self):
@@ -210,6 +492,38 @@ class ConversionTest(TempDirTestCase):
         self.assertTrue((self.tmp / "music_mp3" / "good.mp3").is_file())
         self.assertFalse((self.tmp / "music_mp3" / "broken.mp3").exists(),
                          "a broken conversion left an output file behind")
+
+    def test_failure_summary_lists_exactly_the_failed_files(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "good.wav")
+        (source / "bad_one.flac").write_text("this is not audio at all\n")
+        (source / "bad_two.wav").write_text("nor is this\n")
+
+        result = run_aconv("music", "mp3", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        lines = result.stdout.splitlines()
+        self.assertIn("2 file(s) failed to convert:", lines, result.stdout)
+        listed = lines[lines.index("2 file(s) failed to convert:") + 1:]
+        self.assertEqual(
+            [line.split(": ", 1)[0] for line in listed],
+            [f"  {(source / 'bad_one.flac').resolve()}",
+             f"  {(source / 'bad_two.wav').resolve()}"])
+        for line in listed:
+            self.assertNotEqual(line.split(": ", 1)[1].strip(), "",
+                                "a failure was listed without a reason")
+
+    def test_successful_run_prints_no_failure_summary(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+
+        result = run_aconv("music", "mp3", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Conversion complete!", result.stdout)
+        self.assertNotIn("failed to convert", result.stdout)
 
     def test_cover_art_source_converts_to_a_container_without_art(self):
         """ffmpeg picks theora for .ogg video streams, which fails; art must be dropped."""
@@ -258,6 +572,105 @@ class ConversionTest(TempDirTestCase):
         self.assertIn("skipping files already in the target format", result.stdout)
 
 
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+class StreamCopyTest(TempDirTestCase):
+    """Cross-container remuxes: FLAC inside Matroska converted to .flac."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = self.tmp.resolve()
+        self.source = self.tmp / "music"
+        self.source.mkdir()
+        make_tone(self.source / "song.mka", extra=["-c:a", "flac"])
+
+    def resolve(self, *cli_args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            options = aconv.resolve_options(list(cli_args))
+        return options, out.getvalue()
+
+    def test_flac_in_mka_is_remuxed_to_flac(self):
+        result = run_aconv("music", "flac", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("remuxing without re-encoding", result.stdout)
+        _, codec = probe(self.tmp / "music_flac" / "song.flac", "stream=codec_name")
+        self.assertEqual(codec, "flac")
+
+    def test_resolve_marks_the_matching_source_for_remux(self):
+        options, _ = self.resolve(str(self.source), "flac", "--no-input")
+
+        self.assertEqual(options.remux_sources, {self.source / "song.mka"})
+        copy_at = options.remux_args.index("-c:a")
+        self.assertEqual(options.remux_args[copy_at:copy_at + 2], ["-c:a", "copy"])
+
+    def test_bitrate_forces_a_real_encode(self):
+        options, _ = self.resolve(str(self.source), "flac", "--no-input",
+                                  "--bitrate", "320k")
+        self.assertEqual(options.remux_sources, set())
+
+    def test_sample_rate_forces_a_real_encode(self):
+        options, _ = self.resolve(str(self.source), "flac", "--no-input",
+                                  "--sample-rate", "22050")
+        self.assertEqual(options.remux_sources, set())
+
+    def test_probe_failure_falls_back_to_a_normal_encode(self):
+        original = aconv.probe_audio_codecs
+        aconv.probe_audio_codecs = lambda path: None
+        self.addCleanup(setattr, aconv, "probe_audio_codecs", original)
+
+        options, _ = self.resolve(str(self.source), "flac", "--no-input")
+
+        self.assertEqual(options.remux_sources, set())
+        self.assertEqual(options.convert_plan,
+                         [(self.source / "song.mka", self.tmp / "music_flac" / "song.flac")])
+
+    def test_dry_run_reports_the_remux(self):
+        result = run_aconv("music", "flac", "--dry-run", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("remuxing", result.stdout)
+        self.assertNotIn("converting", result.stdout)
+        self.assertFalse((self.tmp / "music_flac").exists(), "dry run created the destination")
+
+
+class CancelControlTest(TempDirTestCase):
+    """The registry that lets a stdin-control cancel reach ffmpeg itself.
+
+    interrupt_main() alone stops nothing that is already running: the ffmpeg
+    children never see a signal through a pipe, and the pending interrupt is
+    not delivered while the main thread waits untimed on a future.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(aconv._cancel_event.clear)
+
+    def test_the_sweep_terminates_a_registered_process(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        with aconv._live_lock:
+            aconv._live_processes.add(process)
+        self.addCleanup(aconv._live_processes.discard, process)
+
+        aconv.cancel_active_conversions()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("cancel_active_conversions left the process running")
+
+    def test_convert_file_refuses_to_start_after_a_cancel(self):
+        aconv._cancel_event.set()
+
+        error = aconv.convert_file(self.tmp / "in.wav", self.tmp / "out.mp3")
+
+        self.assertEqual(error, "cancelled before it started")
+        self.assertFalse((self.tmp / "out.mp3").exists())
+
+
 class InterruptTest(TempDirTestCase):
     """Ctrl-C has to stop the batch, not just stop reporting on it.
 
@@ -284,7 +697,7 @@ class InterruptTest(TempDirTestCase):
                 # which never reaches the code under test.
                 threading.Timer(0.15, os.kill, [os.getpid(), signal.SIGINT]).start()
             time.sleep(0.05)
-            return True, str(source_file)
+            return None
 
         original = aconv.convert_file
         aconv.convert_file = slow_convert
@@ -346,15 +759,16 @@ class InterruptTest(TempDirTestCase):
 
         def fake_convert(source_file, dest_file, extra_args=None):
             converted.append(source_file)
-            return True, str(source_file)
+            return None
 
         original = aconv.convert_file
         aconv.convert_file = fake_convert
         self.addCleanup(setattr, aconv, "convert_file", original)
 
-        success = aconv.run_conversions(plan, [], workers=2, weights=None)
+        success, failures = aconv.run_conversions(plan, [], workers=2, weights=None)
 
         self.assertEqual(success, 6)
+        self.assertEqual(failures, [])
         self.assertEqual(len(converted), 6)
 
     def test_failures_are_counted_but_do_not_stop_the_batch(self):
@@ -362,16 +776,17 @@ class InterruptTest(TempDirTestCase):
 
         def flaky_convert(source_file, dest_file, extra_args=None):
             if source_file.name == "in2.wav":
-                return False, f"Failed to convert {source_file}: synthetic"
-            return True, str(source_file)
+                return "synthetic"
+            return None
 
         original = aconv.convert_file
         aconv.convert_file = flaky_convert
         self.addCleanup(setattr, aconv, "convert_file", original)
 
-        success = aconv.run_conversions(plan, [], workers=2, weights=None)
+        success, failures = aconv.run_conversions(plan, [], workers=2, weights=None)
 
         self.assertEqual(success, 3)
+        self.assertEqual(failures, [(self.tmp / "in2.wav", "synthetic")])
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
@@ -447,6 +862,348 @@ class ScriptableFlagsTest(TempDirTestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("source is required", result.stdout)
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
+class JsonlProtocolTest(TempDirTestCase):
+    """The --progress jsonl contract: pure JSON on stdout, humans on stderr.
+
+    The event stream is what a GUI or any other machine consumer parses, so
+    these tests pin the field names and the ordering guarantees, not just
+    that something JSON-shaped comes out.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # run_aconv resolves the paths it prints, so resolve ours too or none
+        # of the source/dest assertions would compare equal on macOS.
+        self.tmp = self.tmp.resolve()
+
+    def events(self, result):
+        """Parse stdout as one JSON object per line; anything else fails."""
+        events = []
+        for line in result.stdout.splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                self.fail(f"stdout is not pure JSON: {line!r}")
+        return events
+
+    def test_full_event_stream_for_a_real_conversion(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav", frequency=440)
+        make_tone(source / "b.flac", frequency=550)
+        make_tone(source / "keep.mp3", frequency=660)
+
+        result = run_aconv("music", "mp3", "--progress", "jsonl",
+                           "--on-existing", "copy", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.events(result)
+        self.assertEqual(events[0],
+                         {"event": "hello", "protocol": 1, "version": aconv.__version__})
+        kinds = [e["event"] for e in events]
+        scan = events[kinds.index("scan")]
+        self.assertEqual((scan["found"], scan["to_convert"], scan["already_in_format"]),
+                         (3, 2, 1))
+        plan = events[kinds.index("plan")]
+        self.assertEqual((plan["keep"], plan["convert"], plan["remux"], plan["on_existing"]),
+                         (1, 2, 0, "copy"))
+        self.assertEqual(plan["dest"], str(self.tmp / "music_mp3"))
+        self.assertEqual(events[kinds.index("keep_done")]["count"], 1)
+        probes = [e for e in events if e["event"] == "probe"]
+        self.assertEqual(probes[-1], {"event": "probe", "done": 2, "total": 2})
+        done_for = [e["source"] for e in events if e["event"] == "file_done"]
+        self.assertEqual(sorted(done_for),
+                         sorted([str(source / "a.wav"), str(source / "b.flac")]))
+        for e in events:
+            if e["event"] == "file_done":
+                self.assertIsInstance(e["seconds"], float)
+        # Every file_start precedes its file_done.
+        for src in done_for:
+            start_at = next(i for i, e in enumerate(events)
+                            if e["event"] == "file_start" and e["source"] == src)
+            done_at = next(i for i, e in enumerate(events)
+                           if e["event"] == "file_done" and e["source"] == src)
+            self.assertLess(start_at, done_at)
+        self.assertEqual(events[-1], {"event": "done", "converted": 2, "failed": 0})
+        self.assertIn("Conversion complete!", result.stderr,
+                      "the human summary did not go to stderr")
+
+    def test_ffmpeg_failure_emits_file_failed(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "good.wav")
+        (source / "broken.flac").write_text("this is not audio at all\n")
+
+        result = run_aconv("music", "mp3", "--progress", "jsonl", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        events = self.events(result)
+        failed = [e for e in events if e["event"] == "file_failed"]
+        self.assertEqual([e["source"] for e in failed], [str(source / "broken.flac")])
+        self.assertNotEqual(failed[0]["error"].strip(), "",
+                            "file_failed carried no ffmpeg stderr")
+        self.assertEqual(events[-1], {"event": "done", "converted": 1, "failed": 1})
+
+    def test_plan_counts_convert_and_remux_disjointly(self):
+        # A consumer totals the batch as convert + remux, so a remuxed file
+        # must not be counted under both fields.
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "song.mka", extra=["-c:a", "flac"])
+        make_tone(source / "other.wav")
+
+        result = run_aconv("music", "flac", "--progress", "jsonl", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.events(result)
+        plan = next(e for e in events if e["event"] == "plan")
+        self.assertEqual((plan["convert"], plan["remux"]), (1, 1))
+        actions = sorted(e["action"] for e in events if e["event"] == "file_start")
+        self.assertEqual(actions, ["convert", "remux"])
+
+    def test_dry_run_emits_plan_items_and_writes_nothing(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "song.wav")
+        make_tone(source / "keep.mp3")
+
+        result = run_aconv("music", "mp3", "--progress", "jsonl", "--dry-run",
+                           "--on-existing", "copy", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        items = [e for e in self.events(result) if e["event"] == "plan_item"]
+        self.assertEqual(
+            sorted((e["action"], e["source"], e["dest"]) for e in items),
+            sorted([("copy", str(source / "keep.mp3"),
+                     str(self.tmp / "music_mp3" / "keep.mp3")),
+                    ("convert", str(source / "song.wav"),
+                     str(self.tmp / "music_mp3" / "song.mp3"))]))
+        self.assertFalse((self.tmp / "music_mp3").exists(), "dry run created the destination")
+
+    def test_missing_source_emits_an_error_event(self):
+        result = run_aconv("--progress", "jsonl", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 1)
+        events = self.events(result)
+        self.assertEqual(events[0]["event"], "hello")
+        self.assertEqual(events[-1]["event"], "error")
+        self.assertIn("source is required", events[-1]["message"])
+
+    def test_stdin_control_cancel_stops_the_run(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        # Long enough that the batch cannot finish before the cancel lands.
+        for i in range(5):
+            make_tone(source / f"tone{i}.wav", duration=20)
+
+        process = subprocess.Popen(
+            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
+             "--stdin-control", "--workers", "1"],
+            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        events = []
+        try:
+            for line in process.stdout:
+                events.append(json.loads(line))
+                if events[-1]["event"] == "file_start":
+                    process.stdin.write("cancel\n")
+                    process.stdin.flush()
+                    break
+            events.extend(json.loads(line) for line in process.stdout)
+            code = process.wait(timeout=120)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr = process.stderr.read()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(code, 130, stderr)
+        kinds = [e["event"] for e in events]
+        self.assertIn("interrupted", kinds)
+        self.assertIn("dropped", events[kinds.index("interrupted")])
+        self.assertNotIn("done", kinds, "the batch ran to completion despite the cancel")
+        # Whatever was mid-flight when the cancel landed must have finished
+        # whole or been removed, never left truncated.
+        dest = self.tmp / "music_mp3"
+        if dest.exists():
+            for output in dest.iterdir():
+                returncode, duration = probe(output, "format=duration")
+                self.assertEqual(returncode, 0, f"{output.name} was left unreadable")
+                self.assertAlmostEqual(float(duration), 20.0, delta=1.0,
+                                       msg=f"{output.name} was left truncated")
+
+    @unittest.skipUnless(os.name == "posix", "SIGTERM delivery is POSIX-only")
+    def test_sigterm_cleans_up_like_a_cancel(self):
+        # A controller that gives up on the stdin channel falls back to
+        # terminating the process; that must behave like a cancel, stop the
+        # in-flight ffmpeg, remove its partial output, exit 130, rather than
+        # kill aconv and leave an orphaned encoder writing a truncated file.
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "long.wav", duration=300)
+
+        process = subprocess.Popen(
+            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
+             "--stdin-control", "--workers", "1"],
+            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        events = []
+        try:
+            for line in process.stdout:
+                events.append(json.loads(line))
+                if events[-1]["event"] == "file_start":
+                    process.send_signal(signal.SIGTERM)
+                    break
+            events.extend(json.loads(line) for line in process.stdout)
+            code = process.wait(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr = process.stderr.read()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(code, 130, stderr)
+        self.assertNotIn("done", [e["event"] for e in events],
+                         "the batch ran to completion despite the SIGTERM")
+        dest = self.tmp / "music_mp3"
+        leftovers = list(dest.glob("*.mp3")) if dest.exists() else []
+        self.assertEqual(leftovers, [],
+                         "a terminated encode left its partial output behind")
+
+    @unittest.skipUnless(os.name == "posix", "preexec_fn is POSIX-only")
+    def test_stdin_control_cancel_works_with_sigint_ignored(self):
+        # A shell starts background jobs with SIGINT ignored, the child
+        # inherits that through exec, and interrupt_main() is then a silent
+        # no-op: without a restored handler the cancel channel does nothing
+        # and the batch runs to completion.
+        source = self.tmp / "music"
+        source.mkdir()
+        for i in range(3):
+            make_tone(source / f"tone{i}.wav", duration=20)
+
+        process = subprocess.Popen(
+            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
+             "--stdin-control", "--workers", "1"],
+            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+        events = []
+        try:
+            for line in process.stdout:
+                events.append(json.loads(line))
+                if events[-1]["event"] == "file_start":
+                    process.stdin.write("cancel\n")
+                    process.stdin.flush()
+                    break
+            events.extend(json.loads(line) for line in process.stdout)
+            code = process.wait(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr = process.stderr.read()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(code, 130, stderr)
+        self.assertNotIn("done", [e["event"] for e in events],
+                         "the batch ran to completion despite the cancel")
+
+    def test_stdin_control_cancel_terminates_the_conversion_in_flight(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        # A single file whose encode far outlives the cancel. Without the
+        # terminate sweep the cancel only lands once the file finishes: the
+        # stream would show file_done and the full output would remain.
+        make_tone(source / "long.wav", duration=300)
+
+        process = subprocess.Popen(
+            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
+             "--stdin-control", "--workers", "1"],
+            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        events = []
+        try:
+            for line in process.stdout:
+                events.append(json.loads(line))
+                if events[-1]["event"] == "file_start":
+                    process.stdin.write("cancel\n")
+                    process.stdin.flush()
+                    break
+            events.extend(json.loads(line) for line in process.stdout)
+            code = process.wait(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr = process.stderr.read()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(code, 130, stderr)
+        kinds = [e["event"] for e in events]
+        self.assertIn("interrupted", kinds)
+        self.assertNotIn("file_done", kinds,
+                         "the in-flight encode ran to completion despite the cancel")
+        dest = self.tmp / "music_mp3"
+        leftovers = list(dest.glob("*.mp3")) if dest.exists() else []
+        self.assertEqual(leftovers, [],
+                         "a terminated encode left its partial output behind")
+
+    def test_default_mode_emits_no_json_and_is_unchanged(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+
+        result = run_aconv("music", "mp3", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("{", result.stdout)
+        self.assertIn("Found 1 audio files. Converting to .mp3...", result.stdout)
+        self.assertIn(f"Destination: {self.tmp / 'music_mp3'}", result.stdout)
+        self.assertIn("Conversion complete! 1/1 files successfully converted.",
+                      result.stdout)
+
+    def test_progress_none_keeps_the_human_output_without_a_bar(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+
+        result = run_aconv("music", "mp3", "--progress", "none", cwd=self.tmp)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Conversion complete! 1/1 files successfully converted.",
+                      result.stdout)
+        self.assertEqual(result.stderr, "", "something other than the bar wrote to stderr")
+        self.assertTrue((self.tmp / "music_mp3" / "a.mp3").is_file())
+
+    def test_jsonl_never_imports_tqdm(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "a.wav")
+        script = (
+            "import sys\n"
+            "import aconv\n"
+            "options = aconv.resolve_options([sys.argv[1], 'mp3', '--progress', 'jsonl'])\n"
+            "aconv.execute(options)\n"
+            "assert 'tqdm' not in sys.modules, 'a jsonl run imported tqdm'\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(source)],
+            cwd=str(Path(ACONV).parent), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg and ffprobe are required")
@@ -608,6 +1365,11 @@ class CliValidationTest(TempDirTestCase):
         result = run_aconv("nope", "mp3", cwd=self.tmp)
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not exist", result.stdout)
+
+    def test_stdin_control_requires_jsonl(self):
+        result = run_aconv("music", "mp3", "--stdin-control", cwd=self.tmp)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--stdin-control requires --progress jsonl", result.stderr)
 
 
 if __name__ == "__main__":
