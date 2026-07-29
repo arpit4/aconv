@@ -33,7 +33,9 @@ Fixes both known issues from v0.1.0.
   never prompts, since a prompt would deadlock the consumer, and never imports
   `tqdm`, so it runs from a bare checkout. `--stdin-control` adds a cancel
   channel: the line `cancel`, or EOF from a dead controller, stops the run
-  exactly like Ctrl-C, exiting 130. The default bar mode's output is
+  exactly like Ctrl-C, exiting 130, including terminating the encode in
+  flight, which no signal on the far side of a pipe would otherwise reach,
+  and the same cleanup runs on SIGTERM. The default bar mode's output is
   byte-identical to before, and exit codes stay the ground truth throughout.
 - **An optional Tk GUI.** `aconv_gui.py` runs straight from a source checkout
   (`python3 aconv_gui.py`, standard library only) and is a pure consumer of
@@ -47,7 +49,7 @@ Fixes both known issues from v0.1.0.
   (the copy/move/skip choice, destination resolution, `--skip-existing`
   filtering) is testable in-process without a pty. Pure refactor; the CLI
   behaves identically.
-- 111 tests across the CLI and GUI suites, up from 41.
+- 119 tests across the CLI and GUI suites, up from 41.
 
 ## v0.1.0
 

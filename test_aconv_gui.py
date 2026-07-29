@@ -364,5 +364,82 @@ class AppSmokeTest(unittest.TestCase):
         window.destroy()
 
 
+class AppCancelPathsTest(unittest.TestCase):
+    """App-layer regressions around cancelling. These drive real widgets, so
+    they need a display, probed per test-class the same way AppSmokeTest does.
+    """
+
+    def setUp(self):
+        try:
+            import tkinter
+        except ImportError as exc:
+            self.skipTest(f"tkinter is not installed: {exc}")
+        self.tkinter = tkinter
+        try:
+            self.app = aconv_gui.App()
+        except tkinter.TclError as exc:
+            self.skipTest(f"no display available: {exc}")
+        self.app.root.withdraw()
+        self.addCleanup(self._destroy)
+
+    def _destroy(self):
+        try:
+            self.app.root.destroy()
+        except self.tkinter.TclError:
+            pass
+
+    def test_close_survives_the_child_finishing_during_the_dialog(self):
+        # askyesno pumps the event loop, so _poll can retire the runner while
+        # the question is open; Yes must then simply close the window instead
+        # of cancelling a run that no longer exists.
+        class Finished:
+            running = True
+
+            def cancel(self):
+                raise AssertionError("cancelled a run that already finished")
+
+        self.app.runner = Finished()
+
+        def yes_and_retire(*_args, **_kwargs):
+            self.app.runner = None
+            return True
+
+        original = aconv_gui.messagebox.askyesno
+        aconv_gui.messagebox.askyesno = yes_and_retire
+        self.addCleanup(setattr, aconv_gui.messagebox, "askyesno", original)
+
+        self.app._on_close()
+
+        with self.assertRaises(self.tkinter.TclError):
+            self.app.root.winfo_exists()
+
+    def test_cancelled_preview_reports_preview_cancelled(self):
+        self.app._reset_run_state(dry_run=True)
+        self.app.cancel_requested = True
+
+        self.app._finish_run({"event": "_exit", "returncode": 130, "stderr_tail": ""})
+
+        self.assertEqual(self.app.status_label.cget("text"), "Preview cancelled.")
+
+    def test_force_cancel_never_touches_a_newer_run(self):
+        class Stub:
+            def __init__(self):
+                self.running = True
+                self.terminated = False
+                self.process = self
+
+            def terminate(self):
+                self.terminated = True
+
+        old, current = Stub(), Stub()
+        self.app.runner = current
+
+        self.app._force_cancel(old)
+        self.assertFalse(old.terminated, "a stale timer terminated the wrong run")
+
+        self.app._force_cancel(current)
+        self.assertTrue(current.terminated)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -634,6 +634,43 @@ class StreamCopyTest(TempDirTestCase):
         self.assertFalse((self.tmp / "music_flac").exists(), "dry run created the destination")
 
 
+class CancelControlTest(TempDirTestCase):
+    """The registry that lets a stdin-control cancel reach ffmpeg itself.
+
+    interrupt_main() alone stops nothing that is already running: the ffmpeg
+    children never see a signal through a pipe, and the pending interrupt is
+    not delivered while the main thread waits untimed on a future.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(aconv._cancel_event.clear)
+
+    def test_the_sweep_terminates_a_registered_process(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        with aconv._live_lock:
+            aconv._live_processes.add(process)
+        self.addCleanup(aconv._live_processes.discard, process)
+
+        aconv.cancel_active_conversions()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("cancel_active_conversions left the process running")
+
+    def test_convert_file_refuses_to_start_after_a_cancel(self):
+        aconv._cancel_event.set()
+
+        error = aconv.convert_file(self.tmp / "in.wav", self.tmp / "out.mp3")
+
+        self.assertEqual(error, "cancelled before it started")
+        self.assertFalse((self.tmp / "out.mp3").exists())
+
+
 class InterruptTest(TempDirTestCase):
     """Ctrl-C has to stop the batch, not just stop reporting on it.
 
@@ -1000,6 +1037,129 @@ class JsonlProtocolTest(TempDirTestCase):
                 self.assertEqual(returncode, 0, f"{output.name} was left unreadable")
                 self.assertAlmostEqual(float(duration), 20.0, delta=1.0,
                                        msg=f"{output.name} was left truncated")
+
+    @unittest.skipUnless(os.name == "posix", "SIGTERM delivery is POSIX-only")
+    def test_sigterm_cleans_up_like_a_cancel(self):
+        # A controller that gives up on the stdin channel falls back to
+        # terminating the process; that must behave like a cancel, stop the
+        # in-flight ffmpeg, remove its partial output, exit 130, rather than
+        # kill aconv and leave an orphaned encoder writing a truncated file.
+        source = self.tmp / "music"
+        source.mkdir()
+        make_tone(source / "long.wav", duration=300)
+
+        process = subprocess.Popen(
+            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
+             "--stdin-control", "--workers", "1"],
+            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        events = []
+        try:
+            for line in process.stdout:
+                events.append(json.loads(line))
+                if events[-1]["event"] == "file_start":
+                    process.send_signal(signal.SIGTERM)
+                    break
+            events.extend(json.loads(line) for line in process.stdout)
+            code = process.wait(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr = process.stderr.read()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(code, 130, stderr)
+        self.assertNotIn("done", [e["event"] for e in events],
+                         "the batch ran to completion despite the SIGTERM")
+        dest = self.tmp / "music_mp3"
+        leftovers = list(dest.glob("*.mp3")) if dest.exists() else []
+        self.assertEqual(leftovers, [],
+                         "a terminated encode left its partial output behind")
+
+    @unittest.skipUnless(os.name == "posix", "preexec_fn is POSIX-only")
+    def test_stdin_control_cancel_works_with_sigint_ignored(self):
+        # A shell starts background jobs with SIGINT ignored, the child
+        # inherits that through exec, and interrupt_main() is then a silent
+        # no-op: without a restored handler the cancel channel does nothing
+        # and the batch runs to completion.
+        source = self.tmp / "music"
+        source.mkdir()
+        for i in range(3):
+            make_tone(source / f"tone{i}.wav", duration=20)
+
+        process = subprocess.Popen(
+            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
+             "--stdin-control", "--workers", "1"],
+            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+        events = []
+        try:
+            for line in process.stdout:
+                events.append(json.loads(line))
+                if events[-1]["event"] == "file_start":
+                    process.stdin.write("cancel\n")
+                    process.stdin.flush()
+                    break
+            events.extend(json.loads(line) for line in process.stdout)
+            code = process.wait(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr = process.stderr.read()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(code, 130, stderr)
+        self.assertNotIn("done", [e["event"] for e in events],
+                         "the batch ran to completion despite the cancel")
+
+    def test_stdin_control_cancel_terminates_the_conversion_in_flight(self):
+        source = self.tmp / "music"
+        source.mkdir()
+        # A single file whose encode far outlives the cancel. Without the
+        # terminate sweep the cancel only lands once the file finishes: the
+        # stream would show file_done and the full output would remain.
+        make_tone(source / "long.wav", duration=300)
+
+        process = subprocess.Popen(
+            [sys.executable, ACONV, "music", "mp3", "--progress", "jsonl",
+             "--stdin-control", "--workers", "1"],
+            cwd=str(self.tmp), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        events = []
+        try:
+            for line in process.stdout:
+                events.append(json.loads(line))
+                if events[-1]["event"] == "file_start":
+                    process.stdin.write("cancel\n")
+                    process.stdin.flush()
+                    break
+            events.extend(json.loads(line) for line in process.stdout)
+            code = process.wait(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            stderr = process.stderr.read()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(code, 130, stderr)
+        kinds = [e["event"] for e in events]
+        self.assertIn("interrupted", kinds)
+        self.assertNotIn("file_done", kinds,
+                         "the in-flight encode ran to completion despite the cancel")
+        dest = self.tmp / "music_mp3"
+        leftovers = list(dest.glob("*.mp3")) if dest.exists() else []
+        self.assertEqual(leftovers, [],
+                         "a terminated encode left its partial output behind")
 
     def test_default_mode_emits_no_json_and_is_unchanged(self):
         source = self.tmp / "music"

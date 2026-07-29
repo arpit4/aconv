@@ -800,6 +800,10 @@ class App:
                      f"-> {plan.get('dest', '')}")
         elif returncode == 0:
             self.status_label.configure(text='Preview finished.')
+        elif self.cancel_requested or returncode == 130:
+            # Exit 130 is a cancel, not a failure; translating its stderr
+            # would dress the run's last human line up as an error.
+            self.status_label.configure(text='Preview cancelled.')
         else:
             self.status_label.configure(
                 text=self.error_message or translate_error(stderr_tail))
@@ -822,12 +826,27 @@ class App:
         self.cancel_button.state(['disabled'])
         self.status_label.configure(text='Cancelling...')
         self.runner.cancel()
+        # A child that ignores the channel must not leave Cancel a dead button
+        # with ffmpeg still burning CPU; SIGTERM reaches the same cleanup path
+        # through the CLI's handler.
+        self.root.after(self.FORCE_QUIT_MS, self._force_cancel, self.runner)
+
+    def _force_cancel(self, runner):
+        # Bound to the run it was armed for: by the time the timer fires that
+        # run may be long gone, and a later one must not be shot down.
+        if self.runner is runner and runner.running:
+            runner.process.terminate()
 
     def _on_close(self):
         if self.runner is not None and self.runner.running:
             confirmed = messagebox.askyesno(
                 'aconv', 'A run is still in progress. Cancel it and quit?')
             if not confirmed:
+                return
+            # The modal dialog pumps the event loop, so _poll kept draining
+            # and the child may have finished while the question was open.
+            if self.runner is None or not self.runner.running:
+                self.root.destroy()
                 return
             self.quit_after_exit = True
             self.cancel_requested = True

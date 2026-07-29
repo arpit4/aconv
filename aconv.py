@@ -89,21 +89,54 @@ def make_emitter():
 
     return emit
 
+# The ffmpeg processes currently running, so a cancel request can reach them.
+# A controller on the far side of a pipe has no terminal: its ffmpeg
+# grandchildren never see a SIGINT, and _thread.interrupt_main() alone is not
+# delivered while the main thread waits untimed on a future. Without the
+# sweep, a single long encode would run to completion after the cancel.
+_cancel_event = threading.Event()
+_live_processes = set()
+_live_lock = threading.Lock()
+
+def cancel_active_conversions():
+    """Terminate the ffmpeg processes in flight and refuse to start new ones."""
+    _cancel_event.set()
+    with _live_lock:
+        processes = list(_live_processes)
+    for process in processes:
+        process.terminate()
+
 def start_stdin_control():
     """Watch stdin for a cancel request from the controlling process.
 
     The line "cancel", or EOF, which is what a dead controller looks like,
-    funnels into the same KeyboardInterrupt/exit-130 path as Ctrl-C, so a
-    consumer on the other end of a pipe cancels exactly the way a terminal
-    does.
+    terminates the conversions in flight and funnels into the same
+    KeyboardInterrupt/exit-130 path as Ctrl-C. SIGTERM gets the same
+    treatment, so a controller that gives up on the channel and terminates
+    the process outright still leaves no orphaned ffmpeg behind.
     """
     def watch():
         while True:
             line = sys.stdin.readline()
             if not line or line.strip() == 'cancel':
                 break
+        cancel_active_conversions()
         _thread.interrupt_main()
 
+    def on_sigterm(*_):
+        cancel_active_conversions()
+        raise KeyboardInterrupt
+
+    # signal.signal is refused outside the main thread; embedders and the
+    # test suite may call resolve_options from elsewhere, and they can live
+    # without the SIGTERM courtesy.
+    with contextlib.suppress(ValueError):
+        signal.signal(signal.SIGTERM, on_sigterm)
+        # A shell starts background jobs with SIGINT ignored, and
+        # interrupt_main() is a silent no-op while SIGINT is SIG_IGN or
+        # SIG_DFL. The cancel channel was explicitly requested, so restore
+        # the raising handler it depends on.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
     threading.Thread(target=watch, daemon=True).start()
 
 def prompt(message, default=None):
@@ -271,6 +304,10 @@ def measure_durations(files, workers, use_bar=True, emit=None):
 
 def convert_file(source_file, dest_file, extra_args=None):
     """Convert one file. Returns None on success, ffmpeg's stderr on failure."""
+    if _cancel_event.is_set():
+        # A worker that picked its file up after a cancel request must not
+        # start a fresh encode while the run is unwinding.
+        return "cancelled before it started"
     # Ensure destination directory exists
     dest_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -282,19 +319,32 @@ def convert_file(source_file, dest_file, extra_args=None):
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(str(dest_file))
+    process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    with _live_lock:
+        _live_processes.add(process)
+        # The cancel sweep may have run between the check above and this
+        # registration; decide under the lock the sweep holds, act outside it.
+        already_cancelled = _cancel_event.is_set()
+    if already_cancelled:
+        process.terminate()
     try:
-        subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _, stderr = process.communicate()
+    finally:
+        with _live_lock:
+            _live_processes.discard(process)
+    if process.returncode == 0:
         return None
-    except subprocess.CalledProcessError as e:
-        # A failed or interrupted ffmpeg still leaves an empty or truncated file
-        # behind. Remove it, otherwise the next run sees a file that is already
-        # in the target format and treats the broken output as finished work.
-        try:
-            dest_file.unlink()
-        except OSError:
-            # Nothing was written, or it is not ours to delete.
-            pass
-        return e.stderr.decode('utf-8', errors='replace').strip()
+    # A failed or interrupted ffmpeg still leaves an empty or truncated file
+    # behind. Remove it, otherwise the next run sees a file that is already
+    # in the target format and treats the broken output as finished work.
+    try:
+        dest_file.unlink()
+    except OSError:
+        # Nothing was written, or it is not ours to delete.
+        pass
+    if _cancel_event.is_set():
+        return "cancelled"
+    return stderr.decode('utf-8', errors='replace').strip()
 
 def move_file(source_file, dest_file):
     """Move `source_file` onto `dest_file` without a moment where neither exists.
@@ -447,9 +497,11 @@ def run_conversions(convert_plan, extra_args, workers, weights=None, bar_args=No
     fresh ffmpeg, after the terminal's signal has already been and gone. The
     progress bar is down by then, so the batch continues out of sight.
 
-    Conversions already running are left to finish, which is bounded by the
-    worker count. Their ffmpeg processes have had the same Ctrl-C and normally
-    exit on their own, and convert_file() clears up any partial output.
+    Conversions already running are stopped or left to finish, bounded by the
+    worker count: a terminal's Ctrl-C reaches their ffmpeg processes through
+    the process group, and a --stdin-control cancel terminates them explicitly,
+    since no signal crosses a pipe. Either way convert_file() clears up any
+    partial output.
     """
     if bar_args is None:
         bar_args = dict(total=len(convert_plan), unit='file')
